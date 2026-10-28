@@ -76,10 +76,21 @@ const errorEvent = (
   retryable: boolean,
 ): ErrorEvent => ({ type: "error", code, message, retryable });
 
+/**
+ * Billing failures: the Anthropic API answers 400 "credit balance is too low",
+ * the OpenAI adapter maps `insufficient_quota` to 402. Neither is retryable
+ * and neither is the user's fault, so they get their own message.
+ */
+const isQuotaError = (err: InstanceType<typeof Anthropic.APIError>): boolean =>
+  err.status === 402 || /credit balance|insufficient_quota|billing/i.test(err.message);
+
 /** Maps SDK errors to a user-safe event; never leaks keys, URLs or stack traces. */
 function classifyError(err: unknown): ErrorEvent {
   if (err instanceof Anthropic.AuthenticationError) {
     return errorEvent("upstream_error", "AI service is not configured", false);
+  }
+  if (err instanceof Anthropic.APIError && isQuotaError(err)) {
+    return errorEvent("upstream_error", "AI service has no remaining credits; the operator must top up the account", false);
   }
   if (err instanceof Anthropic.APIUserAbortError) {
     return errorEvent("internal_error", "Request was cancelled", false);
@@ -94,6 +105,23 @@ function classifyError(err: unknown): ErrorEvent {
       : errorEvent("upstream_error", "AI service rejected the request", false);
   }
   return errorEvent("internal_error", "Unexpected error while running the assistant", false);
+}
+
+/**
+ * Server-side record of what the provider actually said; the client only gets
+ * the classified event. SDK messages carry status and error type, never the
+ * credential, and `userText` is not part of them.
+ */
+function logModelError(err: unknown): void {
+  const apiError = err instanceof Anthropic.APIError ? err : undefined;
+  console.error(
+    JSON.stringify({
+      event: "agent.model_error",
+      name: err instanceof Error ? err.name : typeof err,
+      status: apiError?.status ?? null,
+      message: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500),
+    }),
+  );
 }
 
 /**
@@ -183,6 +211,7 @@ async function* streamModel(
         if (attempt === 0 && !streamedText) continue;
         return { error: errorEvent("internal_error", "The assistant produced an unreadable reply; please try again", true) };
       }
+      logModelError(err);
       return { error: classifyError(err) };
     }
   }

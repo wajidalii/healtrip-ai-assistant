@@ -239,7 +239,10 @@ export function toAnthropicError(err: unknown): unknown {
   if (err instanceof OpenAI.APIUserAbortError) return new Anthropic.APIUserAbortError({ message: err.message });
   if (err instanceof OpenAI.APIConnectionError) return new Anthropic.APIConnectionError({ message: err.message });
   if (err instanceof OpenAI.APIError) {
-    return Anthropic.APIError.generate(err.status, err.error, err.message, err.headers ?? new Headers());
+    // OpenAI reports an empty credit balance as 429 `insufficient_quota`, which would read as
+    // a retryable rate limit; 402 lets the loop report it as the billing failure it is.
+    const status = err.code === "insufficient_quota" ? 402 : err.status;
+    return Anthropic.APIError.generate(status, err.error, err.message, err.headers ?? new Headers());
   }
   return err;
 }

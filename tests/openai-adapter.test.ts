@@ -289,6 +289,20 @@ describe("runTurn over the OpenAI adapter", () => {
     const rate = new OpenAI.RateLimitError(429, { error: { message: "slow down" } }, "slow down", new Headers());
     expect((await turn([{ throws: rate }])).events[0]).toMatchObject({ code: "upstream_error", retryable: true });
 
+    // Seen live: an account with no credits answers 429 with code insufficient_quota. Not a rate limit.
+    const quota = new OpenAI.RateLimitError(
+      429,
+      { error: { message: "You have no credits remaining.", code: "insufficient_quota", type: "insufficient_quota" } },
+      "429 You have no credits remaining.",
+      new Headers(),
+    );
+    expect((await turn([{ throws: quota }])).events[0]).toEqual({
+      type: "error",
+      code: "upstream_error",
+      message: "AI service has no remaining credits; the operator must top up the account",
+      retryable: false,
+    });
+
     const conn = new OpenAI.APIConnectionError({ message: "ECONNRESET" });
     expect((await turn([{ throws: conn }])).events[0]).toMatchObject({ code: "upstream_error", retryable: true });
 

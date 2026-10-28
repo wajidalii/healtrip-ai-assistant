@@ -437,6 +437,18 @@ describe("runTurn", () => {
     expect(events).toHaveLength(1);
   });
 
+  it("maps a credit-balance failure to a non-retryable billing message", async () => {
+    const low = new Anthropic.BadRequestError(
+      400,
+      { type: "invalid_request_error", message: "Your credit balance is too low to access the Anthropic API." },
+      "Your credit balance is too low to access the Anthropic API.",
+      new Headers(),
+    );
+    const { terminal } = await run([{ throws: low }]).result;
+    expect(terminal).toMatchObject({ type: "error", code: "upstream_error", retryable: false });
+    if (terminal.type === "error") expect(terminal.message).toMatch(/no remaining credits/);
+  });
+
   it("maps AuthenticationError and generic 4xx/5xx without leaking details", async () => {
     const auth = new Anthropic.AuthenticationError(401, { type: "authentication_error" }, "bad key sk-xyz", new Headers());
     const { terminal: t1 } = await run([{ throws: auth }]).result;
