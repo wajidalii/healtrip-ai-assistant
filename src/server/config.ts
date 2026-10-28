@@ -16,6 +16,9 @@ const emptyToUndefined = (value: unknown) =>
 
 const configSchema = z.object({
   ANTHROPIC_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
+  AI_GATEWAY_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
+  /** Set by the Vercel runtime ("1"); any non-empty value counts (docs/DECISIONS.md ADR-8). */
+  VERCEL: z.preprocess(emptyToUndefined, z.string().optional()),
   CLAUDE_MODEL: z.preprocess(emptyToUndefined, z.string().default("claude-opus-5-5")),
   CLAUDE_EFFORT: z.preprocess(emptyToUndefined, z.enum(CLAUDE_EFFORTS).default("low")),
   AGENT_MAX_STEPS: z.preprocess(
@@ -31,6 +34,10 @@ const configSchema = z.object({
 
 export type Config = {
   anthropicApiKey: string | undefined;
+  /** Vercel AI Gateway key; used only when `anthropicApiKey` is unset. */
+  aiGatewayApiKey: string | undefined;
+  /** True when running on Vercel, where an OIDC token can stand in for a key. */
+  onVercel: boolean;
   claudeModel: string;
   claudeEffort: ClaudeEffort;
   agentMaxSteps: number;
@@ -57,6 +64,8 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   const { data } = parsed;
   return {
     anthropicApiKey: data.ANTHROPIC_API_KEY,
+    aiGatewayApiKey: data.AI_GATEWAY_API_KEY,
+    onVercel: data.VERCEL !== undefined,
     claudeModel: data.CLAUDE_MODEL,
     claudeEffort: data.CLAUDE_EFFORT,
     agentMaxSteps: data.AGENT_MAX_STEPS,
