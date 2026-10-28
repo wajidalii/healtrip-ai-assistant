@@ -4,8 +4,10 @@
  *
  * Invariants the UI relies on (docs/SECURITY.md "Error handling model"):
  *  - every stream ends with exactly one terminal event (`done` or `error`);
- *  - a heartbeat comment is sent while the agent is silent so proxies and the
- *    browser's inactivity timeout do not drop a long tool call;
+ *  - a heartbeat comment is sent while the agent is silent so proxies and
+ *    load balancers do not drop the idle connection during a long tool call
+ *    (transport-level only: the browser parser discards comment frames, so
+ *    heartbeats do not reset the UI's inactivity timeout);
  *  - `onFinish` runs exactly once, whether the stream completed, failed or the
  *    client disconnected (the turn lock is released there).
  */

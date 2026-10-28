@@ -77,13 +77,18 @@ export async function* parseSse(
         if (msg) yield msg;
       }
     }
-    // Stream ended: a trailing lone CR is a terminator now, and a final line
-    // without a newline (or without the closing blank line) is still delivered.
+    // Stream ended: a trailing lone CR is a terminator now that no LF can
+    // follow it, so a frame closed by a bare CR is still dispatched.
     buffer += decoder.decode();
-    if (buffer.endsWith("\r")) buffer = buffer.slice(0, -1);
-    if (buffer !== "") handleLine(buffer);
-    const last = flush();
-    if (last) yield last;
+    if (buffer.endsWith("\r")) buffer = buffer.slice(0, -1) + "\n";
+    for (let line = takeLine(); line !== null; line = takeLine()) {
+      const msg = handleLine(line);
+      if (msg) yield msg;
+    }
+    // Anything left (an unterminated line or an event with no closing blank
+    // line) is discarded per the SSE spec. The server always terminates its
+    // frames, so this can only be a truncated frame from a dropped connection;
+    // delivering it would hand half a payload to the decoder.
   } finally {
     reader.releaseLock();
   }
