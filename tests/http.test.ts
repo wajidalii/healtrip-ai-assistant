@@ -436,7 +436,7 @@ describe("toConversationView", () => {
     expect(turn.text).toBe("Let me check how urgent this is.\n\nYou should be seen today.");
     // Same strings the live tool_result events carried (tool-summary.ts).
     expect(turn.toolCalls).toEqual([
-      { id: "tu1", name: "assess_urgency", ok: true, summary: "urgent - cardiology" },
+      { id: "tu1", name: "assess_urgency", ok: true, summary: "urgent - cardiology", urgency: "urgent" },
       { id: "tu2", name: "search_providers", ok: true, summary: "2 of 7 providers found" },
       { id: "tu3", name: "recommend_next_step", ok: true, summary: "Recommendation saved" },
     ]);

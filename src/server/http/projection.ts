@@ -7,12 +7,14 @@
  * messages in between hidden as plumbing. Recommendations are attached from
  * the `recommendations` table, never parsed out of model text.
  */
-import type {
-  ConversationMessageView,
-  ConversationView,
-  Locale,
-  Recommendation,
-  ToolCallView,
+import {
+  URGENCY_LEVELS,
+  type ConversationMessageView,
+  type ConversationView,
+  type Locale,
+  type Recommendation,
+  type ToolCallView,
+  type Urgency,
 } from "@/shared/contracts";
 import type { StoredConversation, StoredMessage, StoredToolCall } from "@/server/repositories/types";
 import { summarizeToolFailure, summarizeToolOutput } from "@/server/agent/tool-summary";
@@ -62,6 +64,19 @@ function recommendationIdFrom(call: StoredToolCall): string | null {
   return typeof id === "string" ? id : null;
 }
 
+const isUrgency = (value: unknown): value is Urgency =>
+  typeof value === "string" && (URGENCY_LEVELS as readonly string[]).includes(value);
+
+/**
+ * The rule engine's verdict stored in a successful `assess_urgency` output, so
+ * the emergency banner survives a reload the same way it was raised live (from
+ * the `tool_result` event). Tolerant: a malformed row simply carries no urgency.
+ */
+function urgencyFrom(call: StoredToolCall): Urgency | undefined {
+  if (call.toolName !== "assess_urgency" || call.isError || !isRecord(call.output)) return undefined;
+  return isUrgency(call.output.urgency) ? call.output.urgency : undefined;
+}
+
 type Turn = {
   startedAt: number;
   texts: string[];
@@ -80,9 +95,15 @@ export function toConversationView(
 
   const toToolCallView = (block: ToolUseBlock): ToolCallView => {
     const call = callsByToolUseId.get(block.id);
-    return call
-      ? { id: block.id, name: call.toolName, ok: !call.isError, summary: summarizeToolCall(call, conversation.locale) }
-      : { id: block.id, name: block.name, ok: false, summary: "no result recorded" };
+    if (!call) return { id: block.id, name: block.name, ok: false, summary: "no result recorded" };
+    const urgency = urgencyFrom(call);
+    return {
+      id: block.id,
+      name: call.toolName,
+      ok: !call.isError,
+      summary: summarizeToolCall(call, conversation.locale),
+      ...(urgency ? { urgency } : {}),
+    };
   };
 
   const findRecommendation = (turn: Turn, endedAt: number): Recommendation | null => {

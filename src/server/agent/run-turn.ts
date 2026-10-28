@@ -346,6 +346,9 @@ export async function* runTurn(input: RunTurnInput): AsyncGenerator<AgentEvent> 
           name: toolUse.name,
           ok: execution.ok,
           summary: execution.summary,
+          // The engine's verdict rides on the assess_urgency result so the UI can
+          // raise the emergency banner before a recommendation exists.
+          ...(execution.ok && execution.urgency ? { urgency: execution.urgency } : {}),
         };
         if (execution.ok && execution.recommendation) {
           yield { type: "recommendation", recommendation: execution.recommendation };

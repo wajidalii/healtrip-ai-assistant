@@ -13,6 +13,7 @@
  */
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import {
+  URGENCY_LEVELS,
   recommendationSchema,
   type AgentErrorCode,
   type AgentEvent,
@@ -20,6 +21,7 @@ import {
   type ConversationView,
   type Locale,
   type Recommendation,
+  type Urgency,
 } from "@/shared/contracts";
 import { ApiRequestError, createConversation, getConversation, postMessage } from "./api";
 import { parseSse } from "./sse";
@@ -28,7 +30,14 @@ export const CONVERSATION_STORAGE_KEY = "healtrip.conversationId";
 const INACTIVITY_TIMEOUT_MS = 90_000;
 
 export type ToolStatus = "running" | "ok" | "error";
-export type ToolActivityItem = { id: string; name: string; status: ToolStatus; summary: string };
+export type ToolActivityItem = {
+  id: string;
+  name: string;
+  status: ToolStatus;
+  summary: string;
+  /** Rule-engine verdict carried by a successful `assess_urgency` result; drives the emergency banner. */
+  urgency?: Urgency;
+};
 
 export type UiError = {
   code: AgentErrorCode | ApiErrorCode | "network" | "unknown";
@@ -72,7 +81,7 @@ type Action =
   | { type: "turn_started"; user: UserMessage | null; assistantId: string; replaceAssistantId: string | null }
   | { type: "text_delta"; assistantId: string; text: string }
   | { type: "tool_call"; assistantId: string; item: ToolActivityItem }
-  | { type: "tool_result"; assistantId: string; id: string; ok: boolean; summary: string }
+  | { type: "tool_result"; assistantId: string; id: string; ok: boolean; summary: string; urgency?: Urgency }
   | { type: "recommendation"; assistantId: string; recommendation: Recommendation }
   | { type: "turn_done"; assistantId: string }
   | { type: "turn_failed"; assistantId: string; error: UiError }
@@ -80,7 +89,8 @@ type Action =
   | { type: "forget_conversation" }
   | { type: "reset" };
 
-const initialState: State = {
+/** Exported for the reducer tests only; the hook owns the state. */
+export const initialState: State = {
   conversationId: null,
   messages: [],
   status: "idle",
@@ -98,7 +108,8 @@ function updateAssistant(
   return messages.map((m) => (m.id === assistantId && m.role === "assistant" ? update(m) : m));
 }
 
-function reducer(state: State, action: Action): State {
+/** Exported for the reducer tests only; the hook owns the state. */
+export function reducer(state: State, action: Action): State {
   switch (action.type) {
     case "hydrating":
       return { ...state, hydrating: true, hydrationError: false };
@@ -154,7 +165,14 @@ function reducer(state: State, action: Action): State {
         messages: updateAssistant(state.messages, action.assistantId, (m) => ({
           ...m,
           toolCalls: m.toolCalls.map((t) =>
-            t.id === action.id ? { ...t, status: action.ok ? "ok" : "error", summary: action.summary } : t,
+            t.id === action.id
+              ? {
+                  ...t,
+                  status: action.ok ? "ok" : "error",
+                  summary: action.summary,
+                  ...(action.ok && action.urgency ? { urgency: action.urgency } : {}),
+                }
+              : t,
           ),
         })),
       };
@@ -242,6 +260,7 @@ function fromConversationView(view: ConversationView): UiMessage[] {
             name: t.name,
             status: t.ok ? "ok" : "error",
             summary: t.summary,
+            ...(t.ok && t.urgency ? { urgency: t.urgency } : {}),
           })),
           recommendation: m.recommendation,
           error: null,
@@ -275,6 +294,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+const isUrgency = (value: unknown): value is Urgency =>
+  typeof value === "string" && (URGENCY_LEVELS as readonly string[]).includes(value);
+
+/**
+ * Whether the emergency banner should be up for this transcript.
+ *
+ * The newest *signal* wins, scanning assistant messages from the latest back:
+ * inside a message the rule engine's latest successful `assess_urgency` result
+ * is authoritative (it arrives before any recommendation and is what the
+ * recommendation must match), with the saved recommendation's urgency as the
+ * fallback for older histories whose tool-call views carry no urgency. A turn
+ * with neither signal (a clarifying question) leaves the previous verdict in
+ * place; a later triage that comes back non-emergency clears it.
+ */
+export function showEmergencyBanner(messages: readonly UiMessage[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.role !== "assistant") continue;
+    const triage = m.toolCalls.findLast((t) => t.name === "assess_urgency" && t.status === "ok" && t.urgency);
+    if (triage?.urgency) return triage.urgency === "emergency";
+    if (m.recommendation) return m.recommendation.urgency === "emergency";
+  }
+  return false;
+}
+
 /**
  * Turns one SSE message into an `AgentEvent`, or null when the payload does
  * not match the contract. The `event:` name wins; `data.type` is a fallback.
@@ -298,9 +342,16 @@ export function decodeAgentEvent(eventName: string, raw: string): AgentEvent | n
         ? { type, id: data.id, name: data.name, input: data.input }
         : null;
     case "tool_result":
-      return typeof data.id === "string" && typeof data.name === "string" && typeof data.ok === "boolean"
-        ? { type, id: data.id, name: data.name, ok: data.ok, summary: typeof data.summary === "string" ? data.summary : "" }
-        : null;
+      if (typeof data.id !== "string" || typeof data.name !== "string" || typeof data.ok !== "boolean") return null;
+      return {
+        type,
+        id: data.id,
+        name: data.name,
+        ok: data.ok,
+        summary: typeof data.summary === "string" ? data.summary : "",
+        // Only a contract value reaches the banner; anything else is dropped, not guessed.
+        ...(isUrgency(data.urgency) ? { urgency: data.urgency } : {}),
+      };
     case "recommendation": {
       // Re-validated against the shared schema: a malformed recommendation never reaches the card.
       const parsed = recommendationSchema.safeParse(data.recommendation);
@@ -474,7 +525,14 @@ export function useAgentStream(locale: Locale): AgentStream {
               });
               break;
             case "tool_result":
-              dispatch({ type: "tool_result", assistantId, id: event.id, ok: event.ok, summary: event.summary });
+              dispatch({
+                type: "tool_result",
+                assistantId,
+                id: event.id,
+                ok: event.ok,
+                summary: event.summary,
+                ...(event.urgency ? { urgency: event.urgency } : {}),
+              });
               break;
             case "recommendation":
               dispatch({ type: "recommendation", assistantId, recommendation: event.recommendation });

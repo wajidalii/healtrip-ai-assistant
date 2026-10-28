@@ -2,7 +2,11 @@
 
 import { useLocale } from "@/i18n/locale";
 
-/** Red banner rendered whenever a recommendation carries `urgency: "emergency"`; `role="alert"` is implicitly assertive. */
+/**
+ * Red banner rendered while the rule engine's latest triage (or, as fallback,
+ * the latest recommendation) says `urgency: "emergency"`; see
+ * `showEmergencyBanner`. `role="alert"` is implicitly assertive.
+ */
 export function EmergencyBanner() {
   const { t } = useLocale();
   return (

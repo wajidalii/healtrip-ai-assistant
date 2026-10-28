@@ -19,6 +19,7 @@ import {
   providerSearchSchema,
   type Locale,
   type Recommendation,
+  type Urgency,
 } from "@/shared/contracts";
 import { assessUrgency, triageInputSchema } from "@/server/triage";
 import type { Repositories } from "@/server/repositories/types";
@@ -56,6 +57,8 @@ export type ToolExecution =
       summary: string;
       /** Set by `recommend_next_step` so the loop can emit the event without re-querying. */
       recommendation?: Recommendation;
+      /** Set by `assess_urgency` so the loop can put the engine's verdict on the `tool_result` event. */
+      urgency?: Urgency;
     }
   | { ok: false; error: string; summary: string };
 
@@ -161,7 +164,12 @@ const assessUrgencyTool = defineTool({
       suggested_specialties: result.suggestedSpecialties,
     };
     ctx.urgency.record(result.urgency);
-    return { ok: true, output, summary: summarizeToolOutput("assess_urgency", output, ctx.locale) };
+    return {
+      ok: true,
+      output,
+      summary: summarizeToolOutput("assess_urgency", output, ctx.locale),
+      urgency: result.urgency,
+    };
   },
 });
 

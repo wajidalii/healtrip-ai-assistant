@@ -7,7 +7,7 @@ import { EmergencyBanner } from "./EmergencyBanner";
 import { LocaleToggle } from "./LocaleToggle";
 import { MessageBubble } from "./MessageBubble";
 import { SamplePrompts } from "./SamplePrompts";
-import { useAgentStream } from "./useAgentStream";
+import { showEmergencyBanner, useAgentStream } from "./useAgentStream";
 
 /** How close (px) to the bottom the reader must be for new content to pull the list down. */
 const STICK_TO_BOTTOM_PX = 80;
@@ -37,13 +37,10 @@ export function ChatWindow() {
     if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  // The banner follows the most recent recommendation only: an earlier emergency
-  // that was later downgraded (after clarification) should not keep shouting.
-  const latestRecommendation = [...messages]
-    .reverse()
-    .find((m) => m.role === "assistant" && m.recommendation !== null);
-  const showEmergency =
-    latestRecommendation?.role === "assistant" && latestRecommendation.recommendation?.urgency === "emergency";
+  // Raised by the rule engine's latest triage verdict (the assess_urgency
+  // tool_result, before any recommendation exists) with the saved recommendation
+  // as fallback; a later triage that comes back non-emergency takes it down.
+  const showEmergency = showEmergencyBanner(messages);
 
   const onRetry = useCallback(() => void retry(), [retry]);
 

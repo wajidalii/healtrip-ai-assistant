@@ -392,6 +392,35 @@ describe("runTurn", () => {
     expect(await repos.conversations.listRecommendations(conversationId)).toEqual([]);
   });
 
+  it("puts the engine's verdict on the assess_urgency tool_result so the banner can rise before any recommendation", async () => {
+    const { result } = run([
+      toolTurn([
+        toolUseBlock("assess_urgency", RED_FLAG_INPUT, "toolu_red"),
+        toolUseBlock("search_providers", SEARCH_INPUT, "toolu_search"),
+        toolUseBlock("assess_urgency", { symptoms: [] }, "toolu_bad"), // rejected by zod
+      ]),
+      toolTurn([toolUseBlock("assess_urgency", ASSESS_INPUT, "toolu_urgent")]),
+      textTurn("Still gathering facts."),
+    ]);
+    const { events, terminal } = await result;
+    expect(terminal.type).toBe("done");
+    expect(ofType(events, "recommendation")).toHaveLength(0);
+
+    const results = ofType(events, "tool_result");
+    expect(results.map((e) => [e.id, e.ok, e.urgency])).toEqual([
+      ["toolu_red", true, "emergency"],
+      ["toolu_search", true, undefined],
+      ["toolu_bad", false, undefined],
+      ["toolu_urgent", true, "urgent"],
+    ]);
+    // Only a successful assess_urgency carries the field at all (no `urgency: undefined` on the wire).
+    expect(results.filter((e) => "urgency" in e).map((e) => e.id)).toEqual(["toolu_red", "toolu_urgent"]);
+    // The event's value is the one the engine wrote to the model-facing output and the audit trail.
+    const audit = await repos.conversations.listToolCalls(conversationId);
+    const stored = audit.find((c) => c.toolUseId === "toolu_red");
+    expect(stored?.output).toMatchObject({ urgency: "emergency", must_call_emergency_services: true });
+  });
+
   it("replays thinking blocks verbatim", async () => {
     const scripted = [thinkingBlock("The patient reports chest pain."), toolUseBlock("assess_urgency", ASSESS_INPUT)];
     const { fake, result } = run([{ content: scripted, stopReason: "tool_use" }, textTurn("ok")]);

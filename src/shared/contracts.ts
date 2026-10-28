@@ -147,6 +147,8 @@ export type ToolCallView = {
   name: string;
   ok: boolean;
   summary: string;
+  /** Rule-engine verdict of a successful `assess_urgency` call (read from its stored output); absent for other tools. */
+  urgency?: Urgency;
 };
 
 export type ConversationMessageView =
@@ -192,7 +194,19 @@ export type AgentEvent =
   | { type: "conversation"; conversationId: string }
   | { type: "text_delta"; text: string }
   | { type: "tool_call"; id: string; name: string; input: unknown }
-  | { type: "tool_result"; id: string; name: string; ok: boolean; summary: string }
+  | {
+      type: "tool_result";
+      id: string;
+      name: string;
+      ok: boolean;
+      summary: string;
+      /**
+       * Rule-engine verdict when the tool is a successful `assess_urgency` call,
+       * so the UI can raise the emergency banner from the triage itself, before
+       * (and independently of) a saved recommendation. Absent for other tools.
+       */
+      urgency?: Urgency;
+    }
   | { type: "recommendation"; recommendation: Recommendation }
   | {
       type: "done";
