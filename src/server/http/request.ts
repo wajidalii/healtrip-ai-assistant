@@ -134,7 +134,7 @@ export async function getAgentDeps(): Promise<AgentDeps> {
   const profile = getProviderProfile();
   if (profile.mode === "unconfigured") {
     // The variable names are operator information; the client only learns that the feature is off.
-    console.error("[agent] no model credentials (ANTHROPIC_API_KEY, AI_GATEWAY_API_KEY or Vercel OIDC); refusing to run the assistant");
+    console.error("[agent] no model credentials (ANTHROPIC_API_KEY, OPENAI_API_KEY, AI_GATEWAY_API_KEY or Vercel OIDC); refusing to run the assistant");
     throw upstream("The AI assistant is not configured on this server.");
   }
   if (!loggedProvider) {

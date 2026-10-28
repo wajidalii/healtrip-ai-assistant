@@ -31,7 +31,7 @@ Route handlers live in `src/app/api/**/route.ts` and are thin: parse → call `s
 ## GET /api/health
 
 ```json
-{ "ok": true, "repository": "memory" | "postgres", "mode": "anthropic" | "gateway-key" | "gateway-oidc" | "unconfigured", "model": "claude-opus-5-5", "version": "0.1.0" }
+{ "ok": true, "repository": "memory" | "postgres", "mode": "anthropic" | "openai" | "gateway-key" | "gateway-oidc" | "unconfigured", "model": "claude-opus-5-5", "version": "0.1.0" }
 ```
 
 `mode` is the credential mode (README "Credential modes") and `model` the effective model id sent to the provider (a gateway slug such as `anthropic/claude-opus-5.5` in the gateway modes). No credential is ever included.

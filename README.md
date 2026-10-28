@@ -35,7 +35,7 @@ preventing the model from inventing providers that do not exist in the database.
 ## Quick start
 
 ```bash
-cp .env.example .env            # add ANTHROPIC_API_KEY (or AI_GATEWAY_API_KEY); DATABASE_URL is optional
+cp .env.example .env            # add ANTHROPIC_API_KEY (or OPENAI_API_KEY / AI_GATEWAY_API_KEY); DATABASE_URL is optional
 npm install
 npm run dev                     # http://localhost:3000  (in-memory DB if DATABASE_URL is unset)
 ```
@@ -57,8 +57,10 @@ Environment variables (all parsed once by `src/server/config.ts`; see `.env.exam
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | unset | Direct Anthropic API (`mode: anthropic`). Only the agent needs credentials; everything else runs without them |
-| `AI_GATEWAY_API_KEY` | unset | Vercel AI Gateway key (`mode: gateway-key`), used when `ANTHROPIC_API_KEY` is unset |
-| `VERCEL` | set by Vercel | With neither key set, selects `mode: gateway-oidc` (AI Gateway with the deployment's OIDC token); not meant to be set by hand |
+| `OPENAI_API_KEY` | unset | OpenAI key (`mode: openai`): the same agent over the OpenAI Responses API through an adapter, used when `ANTHROPIC_API_KEY` is unset |
+| `OPENAI_MODEL` | `gpt-6.1-sol` | Model id for `mode: openai` |
+| `AI_GATEWAY_API_KEY` | unset | Vercel AI Gateway key (`mode: gateway-key`), used when neither key above is set |
+| `VERCEL` | set by Vercel | With no key set, selects `mode: gateway-oidc` (AI Gateway with the deployment's OIDC token); not meant to be set by hand |
 | `CLAUDE_MODEL` | `claude-opus-5-5` | Model id; mapped to a `provider/model` slug in the gateway modes (see below) |
 | `CLAUDE_EFFORT` | `low` | `output_config.effort`: `low`, `medium`, `high`, `xhigh`, `max` |
 | `AGENT_MAX_STEPS` | `6` | Model calls per user message (1–10); also sets the turn-lock TTL (steps × 60 s) |
@@ -67,16 +69,17 @@ Environment variables (all parsed once by `src/server/config.ts`; see `.env.exam
 
 ### Credential modes
 
-`src/server/agent/claude.ts` picks one of three ways to reach the model from the environment, in this order; `GET /api/health` reports the chosen `mode` and the effective `model` (never a credential):
+`src/server/agent/claude.ts` picks one of four ways to reach the model from the environment, in this order; `GET /api/health` reports the chosen `mode` and the effective `model` (never a credential):
 
 | Mode | When | Request | Vercel env vars needed |
 | --- | --- | --- | --- |
 | `anthropic` | `ANTHROPIC_API_KEY` set | `api.anthropic.com`, `fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta | `ANTHROPIC_API_KEY` |
+| `openai` | else `OPENAI_API_KEY` set | OpenAI Responses API (`store: false`, encrypted reasoning replayed) through `src/server/agent/openai.ts`, which presents the loop's `ClaudeClient` interface; tools are sent non-strict (zod still validates every input) | `OPENAI_API_KEY` (+ optional `OPENAI_MODEL`) |
 | `gateway-key` | else `AI_GATEWAY_API_KEY` set | `https://ai-gateway.vercel.sh` with the key; no `betas`/`fallbacks` | `AI_GATEWAY_API_KEY` |
 | `gateway-oidc` | else running on Vercel | same URL, bearer token from `getVercelOidcToken()` (`@vercel/functions`) resolved per turn; no `betas`/`fallbacks` | none (enable "Secure Backend Access with OIDC Federation" in the project settings and AI Gateway on the team) |
 | `unconfigured` | none of the above | the agent refuses with a generic `upstream_error`; the rest of the app works | — |
 
-In the gateway modes `CLAUDE_MODEL` is mapped to a gateway slug: a fixed table (`claude-opus-5-5` → `anthropic/claude-opus-5.5`, same for `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-opus-5`, `claude-sonnet-5`), otherwise `anthropic/` + the id with a trailing `-N-N` rewritten to `-N.N`; a value containing `/` is used verbatim. `output_config.effort`, strict tools and prompt caching are unchanged in every mode. Local OIDC: `vercel env pull` writes a short-lived `VERCEL_OIDC_TOKEN`; set `VERCEL=1` as well to select the mode off-platform. `npm run eval` still requires `ANTHROPIC_API_KEY`.
+In the gateway modes `CLAUDE_MODEL` is mapped to a gateway slug: a fixed table (`claude-opus-5-5` → `anthropic/claude-opus-5.5`, same for `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-opus-5`, `claude-sonnet-5`), otherwise `anthropic/` + the id with a trailing `-N-N` rewritten to `-N.N`; a value containing `/` is used verbatim. `output_config.effort`, strict tools and prompt caching are unchanged in the Anthropic and gateway modes. In `openai` mode the adapter translates at the edge (see ADR-9): effort maps to `reasoning.effort`, tools become function tools, the model's reasoning items are stored as opaque `redacted_thinking` blocks and replayed on the next step, and the grounding, urgency and persistence rules are untouched because the loop never sees the difference. Local OIDC: `vercel env pull` writes a short-lived `VERCEL_OIDC_TOKEN`; set `VERCEL=1` as well to select the mode off-platform. `npm run eval` runs in whichever mode the environment selects.
 
 ## How it works (30-second version)
 
@@ -126,7 +129,8 @@ What needs a credential: the model call. The deployment selects `gateway-oidc`, 
 
 | Mode | Vercel env vars | Notes |
 | --- | --- | --- |
-| `anthropic` | `ANTHROPIC_API_KEY` = an Anthropic key (Production scope, "Sensitive") | Direct API with `fallbacks: "default"`; the fastest way to enable the demo |
+| `anthropic` | `ANTHROPIC_API_KEY` = an Anthropic key (Production scope, "Sensitive") | Direct API with `fallbacks: "default"`; the model the prompt and evals were written for |
+| `openai` | `OPENAI_API_KEY` = an OpenAI key (Production scope, "Sensitive"); optional `OPENAI_MODEL` | Same agent over the Responses API via the adapter; cheapest way to turn the demo on with an existing OpenAI account |
 | `gateway-key` | `AI_GATEWAY_API_KEY` = a key from the team's AI Gateway page | Bills the Vercel team; no Anthropic secret on the project |
 | `gateway-oidc` | none; enable *Settings → Security → Secure Backend Access with OIDC Federation* and AI Gateway billing on the team | What the demo runs on now; `VERCEL` is set by the platform |
 

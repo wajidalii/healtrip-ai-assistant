@@ -17,6 +17,8 @@ const emptyToUndefined = (value: unknown) =>
 const configSchema = z.object({
   ANTHROPIC_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
   AI_GATEWAY_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
+  OPENAI_API_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
+  OPENAI_MODEL: z.preprocess(emptyToUndefined, z.string().default("gpt-6.1-sol")),
   /** Set by the Vercel runtime ("1"); any non-empty value counts (docs/DECISIONS.md ADR-8). */
   VERCEL: z.preprocess(emptyToUndefined, z.string().optional()),
   CLAUDE_MODEL: z.preprocess(emptyToUndefined, z.string().default("claude-opus-5-5")),
@@ -34,7 +36,11 @@ const configSchema = z.object({
 
 export type Config = {
   anthropicApiKey: string | undefined;
-  /** Vercel AI Gateway key; used only when `anthropicApiKey` is unset. */
+  /** OpenAI key (`mode: openai`); used when `anthropicApiKey` is unset (docs/DECISIONS.md ADR-9). */
+  openaiApiKey: string | undefined;
+  /** Model id sent to the OpenAI Responses API in `openai` mode. */
+  openaiModel: string;
+  /** Vercel AI Gateway key; used only when the Anthropic and OpenAI keys are unset. */
   aiGatewayApiKey: string | undefined;
   /** True when running on Vercel, where an OIDC token can stand in for a key. */
   onVercel: boolean;
@@ -64,6 +70,8 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
   const { data } = parsed;
   return {
     anthropicApiKey: data.ANTHROPIC_API_KEY,
+    openaiApiKey: data.OPENAI_API_KEY,
+    openaiModel: data.OPENAI_MODEL,
     aiGatewayApiKey: data.AI_GATEWAY_API_KEY,
     onVercel: data.VERCEL !== undefined,
     claudeModel: data.CLAUDE_MODEL,

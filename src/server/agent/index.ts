@@ -16,6 +16,14 @@ export {
   type ClaudeStreamParams,
 } from "@/server/agent/claude";
 export {
+  DEFAULT_OPENAI_MODEL,
+  createOpenAIAdapter,
+  createOpenAIClient,
+  toBetaMessage,
+  toResponsesParams,
+  type OpenAIResponsesClient,
+} from "@/server/agent/openai";
+export {
   TOOL_DEFINITIONS,
   TOOL_NAMES,
   executeTool,

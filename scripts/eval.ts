@@ -16,7 +16,7 @@ import { parseArgs } from "node:util";
 import { z } from "zod";
 import type { AgentEvent, Locale, ProviderSummary, Recommendation } from "@/shared/contracts";
 import { getConfig } from "@/server/config";
-import { createClaudeClient, runTurn } from "@/server/agent";
+import { createClaudeClientForMode, resolveProviderProfile, runTurn, type ClaudeClient, type ProviderProfile } from "@/server/agent";
 import { GroundingSet } from "@/server/agent/grounding";
 import { createMemoryRepositories } from "@/server/repositories/memory";
 import type { Repositories } from "@/server/repositories/types";
@@ -93,12 +93,12 @@ type RoundOutcome = {
 };
 
 async function runRound(
-  deps: { repos: Repositories; client: ReturnType<typeof createClaudeClient>; print: Printer },
+  deps: { repos: Repositories; client: ClaudeClient; profile: ProviderProfile; print: Printer },
   scenario: Scenario,
   conversationId: string,
   userText: string,
 ): Promise<RoundOutcome> {
-  const { repos, client, print } = deps;
+  const { repos, client, profile, print } = deps;
   const config = getConfig();
   const toolCalls: ToolCallRecord[] = [];
   let text = "";
@@ -116,9 +116,10 @@ async function runRound(
     deps: {
       repos,
       client,
-      model: config.claudeModel,
+      model: profile.model,
       effort: config.claudeEffort,
       maxSteps: config.agentMaxSteps,
+      useServerFallbacks: profile.useServerFallbacks,
       signal: AbortSignal.timeout(TURN_TIMEOUT_MS),
     },
   });
@@ -342,7 +343,7 @@ function evaluateExpectations(scenario: Scenario, result: Pick<ScenarioResult, "
 // ---------------------------------------------------------------------------
 
 async function runScenario(
-  deps: { repos: Repositories; client: ReturnType<typeof createClaudeClient>; print: Printer },
+  deps: { repos: Repositories; client: ClaudeClient; profile: ProviderProfile; print: Printer },
   scenario: Scenario,
 ): Promise<ScenarioResult> {
   const { repos, print } = deps;
@@ -418,7 +419,8 @@ async function runScenario(
 const USAGE = `Usage: npm run eval -- [--only <scenario-id>]... [--json]
 
 Scenarios: ${SCENARIOS.map((s) => s.id).join(", ")}
-Requires ANTHROPIC_API_KEY (via .env or the environment). Uses the in-memory repository.`;
+Requires model credentials (ANTHROPIC_API_KEY, OPENAI_API_KEY or AI_GATEWAY_API_KEY via .env or the environment).
+Uses the in-memory repository.`;
 
 function parseCli(argv: string[]): CliOptions | null {
   try {
@@ -448,8 +450,10 @@ async function main(): Promise<number> {
   }
 
   const config = getConfig();
-  if (!config.anthropicApiKey) {
-    console.error("ANTHROPIC_API_KEY is not set. Add it to .env (see .env.example) or export it, then re-run npm run eval.");
+  if (resolveProviderProfile(config).mode === "unconfigured") {
+    console.error(
+      "No model credentials: set ANTHROPIC_API_KEY, OPENAI_API_KEY or AI_GATEWAY_API_KEY in .env (see .env.example) or the environment, then re-run npm run eval.",
+    );
     return 2;
   }
 
@@ -465,11 +469,12 @@ async function main(): Promise<number> {
 
   const print: Printer = options.json ? () => undefined : (text) => process.stdout.write(text);
   const repos = createMemoryRepositories();
-  const client = createClaudeClient(config.anthropicApiKey);
-  const deps = { repos, client, print };
+  const profile = resolveProviderProfile(config);
+  const client = await createClaudeClientForMode(profile.mode, config);
+  const deps = { repos, client, profile, print };
 
   print(
-    `HealTrip eval: model ${config.claudeModel}, effort ${config.claudeEffort}, max steps ${config.agentMaxSteps}, ` +
+    `HealTrip eval: mode ${profile.mode}, model ${profile.model}, effort ${config.claudeEffort}, max steps ${config.agentMaxSteps}, ` +
       `${selected.length} scenario(s), ${repos.kind} repository\n`,
   );
 
@@ -483,7 +488,8 @@ async function main(): Promise<number> {
 
   if (options.json) {
     const report = {
-      model: config.claudeModel,
+      mode: profile.mode,
+      model: profile.model,
       effort: config.claudeEffort,
       maxSteps: config.agentMaxSteps,
       passed,

@@ -6,12 +6,14 @@
  * touching the network. `asClaudeClient` is the compile-time proof that the
  * real client satisfies that slice.
  *
- * Three ways to reach a model (docs/DECISIONS.md ADR-8), chosen from the
- * environment in this order:
+ * Four ways to reach a model (docs/DECISIONS.md ADR-8 and ADR-9), chosen from
+ * the environment in this order:
  *
  * 1. `anthropic`    - ANTHROPIC_API_KEY set: the Anthropic API directly.
- * 2. `gateway-key`  - AI_GATEWAY_API_KEY set: Vercel AI Gateway with a key.
- * 3. `gateway-oidc` - neither key, but running on Vercel: AI Gateway with the
+ * 2. `openai`       - OPENAI_API_KEY set: the OpenAI Responses API behind the
+ *                     adapter in `openai.ts` (same loop, same persisted shape).
+ * 3. `gateway-key`  - AI_GATEWAY_API_KEY set: Vercel AI Gateway with a key.
+ * 4. `gateway-oidc` - no key, but running on Vercel: AI Gateway with the
  *                     deployment's short-lived OIDC token as the bearer token.
  *
  * Otherwise the mode is `unconfigured` and the assistant refuses to run.
@@ -20,6 +22,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessageStreamParams } from "@anthropic-ai/sdk/resources/beta/messages/messages";
 import { getVercelOidcToken } from "@vercel/functions/oidc";
 import { ConfigError, getConfig, loadConfig, type Config } from "@/server/config";
+import { createOpenAIClient } from "@/server/agent/openai";
 
 /** What the loop needs from a stream: text events while running, the full message at the end. */
 export type ClaudeMessageStream = AsyncIterable<Anthropic.Beta.BetaRawMessageStreamEvent> & {
@@ -48,7 +51,7 @@ function asClaudeClient(client: Anthropic): ClaudeClient {
 // Provider modes
 // ---------------------------------------------------------------------------
 
-export type ProviderMode = "anthropic" | "gateway-key" | "gateway-oidc" | "unconfigured";
+export type ProviderMode = "anthropic" | "openai" | "gateway-key" | "gateway-oidc" | "unconfigured";
 
 /**
  * Everything the loop and the health endpoint need to know about the provider.
@@ -58,7 +61,7 @@ export type ProviderProfile = {
   mode: ProviderMode;
   /** Set for the gateway modes; the SDK default (api.anthropic.com) otherwise. */
   baseURL?: string;
-  /** Effective model id: the Anthropic id directly, or a `provider/model` slug through the gateway. */
+  /** Effective model id: the Anthropic id directly, the OpenAI id in `openai` mode, or a `provider/model` gateway slug. */
   model: string;
   /**
    * Send `betas` + `fallbacks: "default"` (server-side safety fallbacks). Only
@@ -104,6 +107,9 @@ export function resolveProviderProfile(config: Config): ProviderProfile {
   if (config.anthropicApiKey) {
     return { mode: "anthropic", model: config.claudeModel, useServerFallbacks: true };
   }
+  if (config.openaiApiKey) {
+    return { mode: "openai", model: config.openaiModel, useServerFallbacks: false };
+  }
   const gateway = {
     baseURL: AI_GATEWAY_BASE_URL,
     model: toGatewayModelId(config.claudeModel),
@@ -147,6 +153,10 @@ export async function createClaudeClientForMode(
       if (!config.anthropicApiKey) throw new ConfigError("ANTHROPIC_API_KEY is not set");
       return createClaudeClient(config.anthropicApiKey);
     }
+    case "openai": {
+      if (!config.openaiApiKey) throw new ConfigError("OPENAI_API_KEY is not set");
+      return createOpenAIClient(config.openaiApiKey);
+    }
     case "gateway-key": {
       if (!config.aiGatewayApiKey) throw new ConfigError("AI_GATEWAY_API_KEY is not set");
       return asClaudeClient(new Anthropic({ baseURL: AI_GATEWAY_BASE_URL, apiKey: config.aiGatewayApiKey }));
@@ -166,7 +176,7 @@ export async function createClaudeClientForMode(
     }
     case "unconfigured":
       throw new ConfigError(
-        "No model credentials: set ANTHROPIC_API_KEY or AI_GATEWAY_API_KEY, or deploy on Vercel with OIDC",
+        "No model credentials: set ANTHROPIC_API_KEY, OPENAI_API_KEY or AI_GATEWAY_API_KEY, or deploy on Vercel with OIDC",
       );
   }
 }

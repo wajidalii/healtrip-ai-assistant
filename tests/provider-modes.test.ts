@@ -40,6 +40,15 @@ describe("resolveProviderMode", () => {
     });
   });
 
+  it("is `openai` with the OpenAI model id and no server fallbacks when OPENAI_API_KEY is set", () => {
+    expect(resolveProviderMode({ OPENAI_API_KEY: "sk-openai-x" })).toEqual<ProviderProfile>({
+      mode: "openai",
+      model: "gpt-6.1-sol",
+      useServerFallbacks: false,
+    });
+    expect(resolveProviderMode({ OPENAI_API_KEY: "sk", OPENAI_MODEL: "gpt-6-luna" }).model).toBe("gpt-6-luna");
+  });
+
   it("is `gateway-key` with the gateway base URL and slug when only AI_GATEWAY_API_KEY is set", () => {
     expect(resolveProviderMode({ AI_GATEWAY_API_KEY: "vck_x" })).toEqual<ProviderProfile>({
       mode: "gateway-key",
@@ -66,9 +75,10 @@ describe("resolveProviderMode", () => {
     });
   });
 
-  it("prefers the Anthropic key over the gateway key, and the gateway key over OIDC", () => {
-    const all = { ANTHROPIC_API_KEY: "sk", AI_GATEWAY_API_KEY: "vck", VERCEL: "1" };
+  it("prefers Anthropic over OpenAI, OpenAI over the gateway key, and the gateway key over OIDC", () => {
+    const all = { ANTHROPIC_API_KEY: "sk", OPENAI_API_KEY: "sk-o", AI_GATEWAY_API_KEY: "vck", VERCEL: "1" };
     expect(resolveProviderMode(all).mode).toBe("anthropic");
+    expect(resolveProviderMode({ OPENAI_API_KEY: "sk-o", AI_GATEWAY_API_KEY: "vck", VERCEL: "1" }).mode).toBe("openai");
     expect(resolveProviderMode({ AI_GATEWAY_API_KEY: "vck", VERCEL: "1" }).mode).toBe("gateway-key");
   });
 
@@ -177,8 +187,16 @@ describe("createClaudeClientForMode", () => {
     await expect(createClaudeClientForMode("gateway-oidc", loadConfig({ VERCEL: "1" }))).rejects.toThrow(/OIDC federation/);
   });
 
+  it("openai: builds the adapter, not an Anthropic SDK client", async () => {
+    const client = await createClaudeClientForMode("openai", loadConfig({ OPENAI_API_KEY: "sk-openai-x" }));
+    expect(client).not.toBeInstanceOf(Anthropic);
+    expect(typeof client.beta.messages.stream).toBe("function");
+    expect(getVercelOidcToken).not.toHaveBeenCalled();
+  });
+
   it("refuses a mode the configuration cannot serve", async () => {
     await expect(createClaudeClientForMode("anthropic", loadConfig({}))).rejects.toThrow(ConfigError);
+    await expect(createClaudeClientForMode("openai", loadConfig({}))).rejects.toThrow(ConfigError);
     await expect(createClaudeClientForMode("gateway-key", loadConfig({}))).rejects.toThrow(ConfigError);
     await expect(createClaudeClientForMode("gateway-oidc", loadConfig({}))).rejects.toThrow(ConfigError);
     await expect(createClaudeClientForMode("unconfigured", loadConfig({}))).rejects.toThrow(ConfigError);
