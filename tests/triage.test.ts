@@ -20,8 +20,9 @@ describe("triageInputSchema", () => {
     expect(triageInputSchema.safeParse({ symptoms }).success).toBe(false);
   });
 
-  it("rejects symptoms over 60 chars and blank symptoms", () => {
-    expect(triageInputSchema.safeParse({ symptoms: ["x".repeat(61)] }).success).toBe(false);
+  it("rejects symptoms over 120 chars and blank symptoms", () => {
+    expect(triageInputSchema.safeParse({ symptoms: ["x".repeat(121)] }).success).toBe(false);
+    expect(triageInputSchema.safeParse({ symptoms: ["x".repeat(120)] }).success).toBe(true);
     expect(triageInputSchema.safeParse({ symptoms: ["   "] }).success).toBe(false);
   });
 

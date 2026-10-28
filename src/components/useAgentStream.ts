@@ -58,10 +58,16 @@ type State = {
   status: StreamStatus;
   lastError: UiError | null;
   hydrating: boolean;
+  /** The stored conversation could not be fetched for a reason other than 404; the id is kept. */
+  hydrationError: boolean;
+  /** The server answered 404 mid-conversation: the transcript on screen has no server history. */
+  conversationLost: boolean;
 };
 
 type Action =
+  | { type: "hydrating" }
   | { type: "hydrated"; conversationId: string | null; messages: UiMessage[] }
+  | { type: "hydration_failed"; conversationId: string }
   | { type: "conversation_created"; conversationId: string }
   | { type: "turn_started"; user: UserMessage | null; assistantId: string; replaceAssistantId: string | null }
   | { type: "text_delta"; assistantId: string; text: string }
@@ -80,6 +86,8 @@ const initialState: State = {
   status: "idle",
   lastError: null,
   hydrating: true,
+  hydrationError: false,
+  conversationLost: false,
 };
 
 function updateAssistant(
@@ -92,8 +100,20 @@ function updateAssistant(
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
+    case "hydrating":
+      return { ...state, hydrating: true, hydrationError: false };
     case "hydrated":
-      return { ...state, hydrating: false, conversationId: action.conversationId, messages: action.messages };
+      return {
+        ...state,
+        hydrating: false,
+        hydrationError: false,
+        conversationId: action.conversationId,
+        messages: action.messages,
+      };
+    case "hydration_failed":
+      // Keep the id: the next send continues the server-side conversation and a
+      // retry can still show its history.
+      return { ...state, hydrating: false, hydrationError: true, conversationId: action.conversationId };
     case "conversation_created":
       return { ...state, conversationId: action.conversationId };
     case "turn_started": {
@@ -176,7 +196,7 @@ function reducer(state: State, action: Action): State {
         })),
       };
     case "forget_conversation":
-      return { ...state, conversationId: null };
+      return { ...state, conversationId: null, conversationLost: true };
     case "reset":
       return { ...initialState, hydrating: false };
   }
@@ -242,6 +262,15 @@ function errorFromApi(err: ApiRequestError): UiError {
   return { code: err.code, message: err.message, retryable: retryable.includes(err.code) };
 }
 
+/**
+ * Only a 404 proves the server forgot the conversation (restart of the in-memory
+ * repository, or a malformed id). Offline, 5xx or a bad payload are transient:
+ * the stored id must survive them (docs/SECURITY.md "Error handling model").
+ */
+export function isConversationGone(err: unknown): boolean {
+  return err instanceof ApiRequestError && err.status === 404;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -250,7 +279,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Turns one SSE message into an `AgentEvent`, or null when the payload does
  * not match the contract. The `event:` name wins; `data.type` is a fallback.
  */
-function decodeAgentEvent(eventName: string, raw: string): AgentEvent | null {
+export function decodeAgentEvent(eventName: string, raw: string): AgentEvent | null {
   let data: unknown;
   try {
     data = JSON.parse(raw);
@@ -273,9 +302,8 @@ function decodeAgentEvent(eventName: string, raw: string): AgentEvent | null {
         ? { type, id: data.id, name: data.name, ok: data.ok, summary: typeof data.summary === "string" ? data.summary : "" }
         : null;
     case "recommendation": {
-      // The API doc shows the recommendation fields at the top level while the
-      // contract nests them under `recommendation`; accept both shapes.
-      const parsed = recommendationSchema.safeParse(data.recommendation ?? data);
+      // Re-validated against the shared schema: a malformed recommendation never reaches the card.
+      const parsed = recommendationSchema.safeParse(data.recommendation);
       return parsed.success ? { type, recommendation: parsed.data } : null;
     }
     case "done": {
@@ -314,9 +342,13 @@ export type AgentStream = {
   status: StreamStatus;
   lastError: UiError | null;
   hydrating: boolean;
+  hydrationError: boolean;
+  conversationLost: boolean;
   conversationId: string | null;
   send: (text: string) => Promise<void>;
   retry: () => Promise<void>;
+  /** Re-fetches the stored conversation after a transient hydration failure. */
+  retryHydration: () => Promise<void>;
   cancel: () => void;
   reset: () => void;
 };
@@ -328,6 +360,8 @@ export function useAgentStream(locale: Locale): AgentStream {
   const lastUserTextRef = useRef<string | null>(null);
   const statusRef = useRef<StreamStatus>("idle");
   const messagesRef = useRef<UiMessage[]>([]);
+  const conversationLostRef = useRef(false);
+  const hydrateControllerRef = useRef<AbortController | null>(null);
 
   // Mirror the latest state into refs so the async `send`/`retry` closures can
   // read fresh values without being recreated on every render.
@@ -335,7 +369,35 @@ export function useAgentStream(locale: Locale): AgentStream {
     statusRef.current = state.status;
     conversationIdRef.current = state.conversationId;
     messagesRef.current = state.messages;
-  }, [state.status, state.conversationId, state.messages]);
+    conversationLostRef.current = state.conversationLost;
+  }, [state.status, state.conversationId, state.messages, state.conversationLost]);
+
+  /** Loads the stored conversation's history; shared by the mount effect and the Retry action. */
+  const hydrate = useCallback(async (stored: string) => {
+    hydrateControllerRef.current?.abort();
+    const ac = new AbortController();
+    hydrateControllerRef.current = ac;
+    try {
+      const view = await getConversation(stored, ac.signal);
+      const messages = fromConversationView(view);
+      const lastUser = [...messages].reverse().find((m) => m.role === "user");
+      lastUserTextRef.current = lastUser ? lastUser.text : null;
+      dispatch({ type: "hydrated", conversationId: view.id, messages });
+    } catch (err: unknown) {
+      if (ac.signal.aborted) return;
+      if (isConversationGone(err)) {
+        // The server forgot it (restart / in-memory repo): start fresh.
+        writeStoredConversationId(null);
+        dispatch({ type: "hydrated", conversationId: null, messages: [] });
+        return;
+      }
+      // Transient failure: keep the id so the conversation is not orphaned, and
+      // tell the user (the UI renders `errors.conversationLoad` with a Retry).
+      dispatch({ type: "hydration_failed", conversationId: stored });
+    } finally {
+      if (hydrateControllerRef.current === ac) hydrateControllerRef.current = null;
+    }
+  }, []);
 
   // Restore a conversation from a previous page load in this tab.
   useEffect(() => {
@@ -344,27 +406,20 @@ export function useAgentStream(locale: Locale): AgentStream {
       dispatch({ type: "hydrated", conversationId: null, messages: [] });
       return;
     }
-    const ac = new AbortController();
-    getConversation(stored, ac.signal)
-      .then((view) => {
-        const messages = fromConversationView(view);
-        const lastUser = [...messages].reverse().find((m) => m.role === "user");
-        lastUserTextRef.current = lastUser ? lastUser.text : null;
-        dispatch({ type: "hydrated", conversationId: view.id, messages });
-      })
-      .catch((err: unknown) => {
-        if (ac.signal.aborted) return;
-        // 404 means the server forgot it (restart / in-memory repo). Any other
-        // failure also starts fresh: keeping an id whose history we cannot
-        // show would make the server-side context invisible to the user.
-        if (!(err instanceof ApiRequestError) || err.status === 404) writeStoredConversationId(null);
-        dispatch({ type: "hydrated", conversationId: null, messages: [] });
-      });
-    return () => ac.abort();
-  }, []);
+    void hydrate(stored);
+    return () => hydrateControllerRef.current?.abort();
+  }, [hydrate]);
 
   // Abort any in-flight stream when the component unmounts.
   useEffect(() => () => controllerRef.current?.abort(), []);
+
+  const retryHydration = useCallback(async () => {
+    const stored = readStoredConversationId();
+    // Replacing the transcript mid-stream would strand the streaming bubble.
+    if (!stored || statusRef.current === "streaming") return;
+    dispatch({ type: "hydrating" });
+    await hydrate(stored);
+  }, [hydrate]);
 
   const runTurn = useCallback(
     async (text: string, user: UserMessage | null, replaceAssistantId: string | null) => {
@@ -459,9 +514,13 @@ export function useAgentStream(locale: Locale): AgentStream {
           dispatch({ type: "turn_cancelled", assistantId });
         } else if (err instanceof ApiRequestError) {
           if (err.status === 404) {
-            // The conversation vanished server-side; the next send creates a new one.
+            // The conversation vanished server-side. The transcript on screen is
+            // kept for the user to read, but sending is blocked until "New
+            // conversation": continuing would run the model against an empty
+            // history the user cannot see.
             writeStoredConversationId(null);
             conversationIdRef.current = null;
+            conversationLostRef.current = true;
             dispatch({ type: "forget_conversation" });
           }
           dispatch({ type: "turn_failed", assistantId, error: errorFromApi(err) });
@@ -483,7 +542,7 @@ export function useAgentStream(locale: Locale): AgentStream {
   const send = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
-      if (!trimmed || statusRef.current === "streaming") return;
+      if (!trimmed || statusRef.current === "streaming" || conversationLostRef.current) return;
       await runTurn(trimmed, { id: newId(), role: "user", text: trimmed }, null);
     },
     [runTurn],
@@ -491,7 +550,7 @@ export function useAgentStream(locale: Locale): AgentStream {
 
   const retry = useCallback(async () => {
     const text = lastUserTextRef.current;
-    if (!text || statusRef.current === "streaming") return;
+    if (!text || statusRef.current === "streaming" || conversationLostRef.current) return;
     const failed = [...messagesRef.current].reverse().find((m) => m.role === "assistant" && m.error !== null);
     await runTurn(text, null, failed ? failed.id : null);
   }, [runTurn]);
@@ -503,7 +562,10 @@ export function useAgentStream(locale: Locale): AgentStream {
   const reset = useCallback(() => {
     controllerRef.current?.abort();
     controllerRef.current = null;
+    hydrateControllerRef.current?.abort();
+    hydrateControllerRef.current = null;
     conversationIdRef.current = null;
+    conversationLostRef.current = false;
     lastUserTextRef.current = null;
     writeStoredConversationId(null);
     dispatch({ type: "reset" });
@@ -514,9 +576,12 @@ export function useAgentStream(locale: Locale): AgentStream {
     status: state.status,
     lastError: state.lastError,
     hydrating: state.hydrating,
+    hydrationError: state.hydrationError,
+    conversationLost: state.conversationLost,
     conversationId: state.conversationId,
     send,
     retry,
+    retryHydration,
     cancel,
     reset,
   };

@@ -8,7 +8,7 @@ import { RED_FLAGS, URGENCY_LEVELS, type RedFlag, type Specialty, type Urgency }
 import { FALLBACK_RULE, RULES, type Concept, type Rule, type TriageFacts } from "@/server/triage/rules";
 
 export const triageInputSchema = z.object({
-  symptoms: z.array(z.string().trim().toLowerCase().min(1).max(60)).min(1).max(10),
+  symptoms: z.array(z.string().trim().toLowerCase().min(1).max(120)).min(1).max(10),
   red_flags: z.array(z.enum(RED_FLAGS)).default([]),
   duration_hours: z.number().min(0).max(8760).optional(),
   severity_1_to_10: z.number().int().min(1).max(10).optional(),

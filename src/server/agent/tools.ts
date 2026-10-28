@@ -23,6 +23,8 @@ import {
 import { assessUrgency, triageInputSchema } from "@/server/triage";
 import type { Repositories } from "@/server/repositories/types";
 import type { GroundingSet } from "@/server/agent/grounding";
+import type { UrgencyRecord } from "@/server/agent/urgency-record";
+import { summarizeToolOutput } from "@/server/agent/tool-summary";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -40,6 +42,8 @@ export type ToolContext = {
   conversationId: string;
   repos: Repositories;
   grounding: GroundingSet;
+  /** The rule engine's latest urgency for this conversation; `recommend_next_step` must match it. */
+  urgency: UrgencyRecord;
   locale: Locale;
 };
 
@@ -131,7 +135,9 @@ const assessUrgencyTool = defineTool({
     properties: {
       symptoms: {
         type: "array",
-        description: "Main complaints in plain English, e.g. ['chest pain', 'shortness of breath']. 1-10 items.",
+        description:
+          "Main complaints in plain English as short phrases (max 120 characters each, 1-10 items), " +
+          "e.g. ['chest pain', 'shortness of breath'].",
         items: { type: "string" },
       },
       red_flags: {
@@ -139,14 +145,14 @@ const assessUrgencyTool = defineTool({
         description: "Red flags the patient explicitly reported. Empty if none.",
         items: enumProp(RED_FLAGS, "A red-flag symptom or risk factor."),
       },
-      duration_hours: { type: "number", description: "How long the symptom has been present, in hours." },
-      severity_1_to_10: { type: "integer", description: "Patient-reported severity, 1 (mild) to 10 (worst)." },
-      age: { type: "integer", description: "Patient age in years, if known." },
+      duration_hours: { type: "number", description: "How long the symptom has been present, in hours (0-8760)." },
+      severity_1_to_10: { type: "integer", description: "Patient-reported severity, an integer from 1 (mild) to 10 (worst)." },
+      age: { type: "integer", description: "Patient age in years (0-120), if known." },
     },
     required: ["symptoms", "red_flags"],
     additionalProperties: false,
   },
-  run: async (input) => {
+  run: async (input, ctx) => {
     const result = assessUrgency(input);
     const output = {
       urgency: result.urgency,
@@ -154,10 +160,8 @@ const assessUrgencyTool = defineTool({
       matched_rules: result.matchedRules,
       suggested_specialties: result.suggestedSpecialties,
     };
-    const summary = result.mustCallEmergencyServices
-      ? "emergency - call emergency services"
-      : `${result.urgency} - ${result.suggestedSpecialties[0] ?? "general_practice"}`;
-    return { ok: true, output, summary };
+    ctx.urgency.record(result.urgency);
+    return { ok: true, output, summary: summarizeToolOutput("assess_urgency", output, ctx.locale) };
   },
 });
 
@@ -199,8 +203,8 @@ const searchProvidersTool = defineTool({
     type: "object",
     properties: {
       specialty: enumProp(SPECIALTIES, "Medical specialty to search for."),
-      city: { type: "string", description: "City name, e.g. 'Istanbul'. Case-insensitive." },
-      country: { type: "string", description: "ISO-3166 alpha-2 country code, e.g. 'TR'." },
+      city: { type: "string", description: "City name, e.g. 'Istanbul'. Case-insensitive, max 80 characters." },
+      country: { type: "string", description: "ISO-3166 alpha-2 country code (exactly two letters), e.g. 'TR'." },
       language: enumProp(LANGUAGES, "Language the provider must speak (ISO-639-1)."),
       emergency_capable: { type: "boolean", description: "Only providers with an emergency department." },
       telemedicine: { type: "boolean", description: "Only providers offering video consultations." },
@@ -221,22 +225,18 @@ const searchProvidersTool = defineTool({
     });
     const { results, total } = await ctx.repos.providers.search(query);
     ctx.grounding.add(results.map((p) => p.id));
-    if (results.length === 0) {
-      return {
-        ok: true,
-        output: {
-          results,
-          total,
-          note:
-            `No active providers match ${describeSearch(input)}. Do not invent one. Tell the patient, then ` +
-            "either widen the search (drop the city or country filter, set telemedicine to true, or try a " +
-            "related specialty) or ask where they are able to travel.",
-        },
-        summary: "No providers found",
-      };
-    }
-    const summary = results.length === 1 ? "1 provider found" : `${results.length} providers found`;
-    return { ok: true, output: { results, total }, summary };
+    const output =
+      results.length === 0
+        ? {
+            results,
+            total,
+            note:
+              `No active providers match ${describeSearch(input)}. Do not invent one. Tell the patient, then ` +
+              "either widen the search (drop the city or country filter, set telemedicine to true, or try a " +
+              "related specialty) or ask where they are able to travel.",
+          }
+        : { results, total };
+    return { ok: true, output, summary: summarizeToolOutput("search_providers", output, ctx.locale) };
   },
 });
 
@@ -260,6 +260,17 @@ const getProviderDetailsTool = defineTool({
     additionalProperties: false,
   },
   run: async (input, ctx) => {
+    // Same rule as recommend_next_step: an id the model never received from a
+    // search (guessed, or pasted by the user) is not looked up, let alone grounded.
+    if (!ctx.grounding.has(input.provider_id)) {
+      return {
+        ok: false,
+        error:
+          `Unknown provider id ${input.provider_id}: it was not returned by search_providers in this ` +
+          `conversation. Allowed ids: [${ctx.grounding.allowedIds().join(", ")}]`,
+        summary: "Rejected: unknown provider id",
+      };
+    }
     const provider = await ctx.repos.providers.getById(input.provider_id);
     if (!provider || !provider.isActive) {
       return {
@@ -272,7 +283,7 @@ const getProviderDetailsTool = defineTool({
     return {
       ok: true,
       output: provider,
-      summary: ctx.locale === "ar" ? provider.nameAr : provider.nameEn,
+      summary: summarizeToolOutput("get_provider_details", provider, ctx.locale),
     };
   },
 });
@@ -297,12 +308,13 @@ const recommendNextStepTool = defineTool({
   description:
     "Records the final recommendation for the patient. This is the ONLY way to give a final answer; free text " +
     "is treated as an interim message. Call it once per decision, after assess_urgency and (unless the case is " +
-    "an emergency or self-care) after search_providers. urgency must be the value assess_urgency returned. " +
-    "provider_ids may only contain ids returned by search_providers or get_provider_details in this " +
+    "an emergency or self-care) after search_providers. urgency must be the value the latest assess_urgency " +
+    "call returned; any other value is rejected, so if new facts change the picture call assess_urgency again " +
+    "first. provider_ids may only contain ids returned by search_providers or get_provider_details in this " +
     "conversation (0-3 ids); anything else is rejected. rationale_for_patient is shown to the patient verbatim " +
     "in their language: explain the step in plain words, name the chosen providers (name and id), and end with " +
-    "a one-line note that this is not medical advice. Returns { ok, recommendation_id } or an error listing " +
-    "the allowed provider ids.",
+    "a one-line note that this is not medical advice. Returns { ok, recommendation_id } or an error saying " +
+    "what to correct.",
   inputSchema: recommendNextStepInput,
   jsonSchema: {
     type: "object",
@@ -313,7 +325,7 @@ const recommendNextStepTool = defineTool({
           "specialist_consultation: book a specialist; second_opinion: review of an existing diagnosis/plan; " +
           "primary_care: see a GP first; self_care_monitor: rest, monitor, return if worse.",
       ),
-      urgency: enumProp(URGENCY_LEVELS, "The urgency returned by assess_urgency."),
+      urgency: enumProp(URGENCY_LEVELS, "The urgency returned by the latest assess_urgency call (exactly)."),
       specialty: {
         anyOf: [enumProp(SPECIALTIES, "Specialty the patient should see."), { type: "null" }],
         description: "Specialty the patient should see, or null when no specialist is needed.",
@@ -329,7 +341,8 @@ const recommendNextStepTool = defineTool({
       },
       questions_remaining: {
         type: "array",
-        description: "Up to 3 things the patient should still clarify with a clinician. Empty if none.",
+        description:
+          "Up to 3 things the patient should still clarify with a clinician (max 200 characters each). Empty if none.",
         items: { type: "string" },
       },
     },
@@ -348,6 +361,28 @@ const recommendNextStepTool = defineTool({
             .allowedIds()
             .join(", ")}]`,
         summary: "Rejected: unknown provider ids",
+      };
+    }
+    // Urgency is decided by the rule engine, never by the model (docs/AGENT.md).
+    // The model's value must be the engine's latest, or the call is refused: user
+    // text or a provider description cannot talk a red-flag case down to self-care.
+    const engineUrgency = ctx.urgency.latest;
+    if (engineUrgency === null) {
+      return {
+        ok: false,
+        error:
+          "Call assess_urgency before recommend_next_step: urgency is decided by the rule engine from the " +
+          "facts you extract, not by you.",
+        summary: "Rejected: urgency not assessed",
+      };
+    }
+    if (input.urgency !== engineUrgency) {
+      return {
+        ok: false,
+        error:
+          `urgency must be '${engineUrgency}', the value assess_urgency returned, not '${input.urgency}'. ` +
+          "If new facts change the picture, call assess_urgency again with them first.",
+        summary: "Rejected: urgency differs from the engine",
       };
     }
     // The step and the urgency must agree on emergencies: a stored record saying
@@ -372,10 +407,11 @@ const recommendNextStepTool = defineTool({
       rationale: input.rationale_for_patient,
       questionsRemaining: input.questions_remaining,
     });
+    const output = { ok: true, recommendation_id: recommendation.id };
     return {
       ok: true,
-      output: { ok: true, recommendation_id: recommendation.id },
-      summary: "Recommendation saved",
+      output,
+      summary: summarizeToolOutput("recommend_next_step", output, ctx.locale),
       recommendation,
     };
   },

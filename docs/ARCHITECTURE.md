@@ -116,7 +116,8 @@ sequenceDiagram
 
 The route streams `AgentEvent`s (defined in `src/shared/contracts.ts`) as SSE frames
 `event: <type>\ndata: <json>\n\n`, where `<json>` is the whole event object including its `type`.
-A `: heartbeat` comment frame is sent every 15 s while the agent is silent.
+A `: heartbeat` comment frame is sent every 15 s while the agent is silent; it keeps proxies from closing the
+connection but is dropped by the browser parser and does not reset the UI's 90 s inactivity timeout.
 
 | event | payload (besides `type`) | UI effect |
 | --- | --- | --- |

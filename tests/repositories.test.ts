@@ -10,7 +10,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import { SEED_PROVIDERS } from "@/server/db/seed-data";
-import { createMemoryRepositories } from "@/server/repositories/memory";
+import { createMemoryRepositories, MemoryConversationRepository } from "@/server/repositories/memory";
 import type { Repositories } from "@/server/repositories/types";
 
 const CARDIOLOGIST_ISTANBUL = "41d456cd-2271-48aa-a326-fbf9818757b3"; // Dr. Elif Kaya
@@ -240,6 +240,51 @@ describe("memory repositories", () => {
     repos = createMemoryRepositories();
   });
   repositorySuite(() => repos);
+
+  describe("retention", () => {
+    it("drops idle conversations and the least recently updated ones over the cap, never a locked one", async () => {
+      let clock = 1_000_000;
+      const repos = createMemoryRepositories(SEED_PROVIDERS, {
+        idleTtlMs: 10_000,
+        maxConversations: 3,
+        now: () => clock,
+      });
+      const store = repos.conversations as MemoryConversationRepository;
+
+      const a = await repos.conversations.create("en");
+      clock += 1_000;
+      const b = await repos.conversations.create("en");
+      clock += 1_000;
+      const c = await repos.conversations.create("en");
+      expect(store.size).toBe(3);
+
+      // Over the cap: the oldest unlocked (a) goes; b is locked and survives even though it is next oldest.
+      expect(await repos.conversations.tryAcquireTurnLock(b.id, 60_000)).toBe(true);
+      clock += 1_000;
+      await repos.conversations.appendMessage(a.id, "user", [{ type: "text", text: "hi" }]); // a is now newest
+      clock += 1_000;
+      const d = await repos.conversations.create("en");
+      expect(store.size).toBe(3);
+      expect(await repos.conversations.get(c.id)).toBeNull();
+      expect(await repos.conversations.get(b.id)).not.toBeNull();
+      expect(await repos.conversations.get(a.id)).not.toBeNull();
+      expect(await repos.conversations.listMessages(c.id)).toEqual([]);
+
+      // Idle TTL: everything unlocked and untouched for 10 s is dropped on the next create.
+      await repos.conversations.releaseTurnLock(b.id);
+      clock += 20_000;
+      await repos.conversations.appendMessage(d.id, "user", [{ type: "text", text: "still here" }]);
+      const e = await repos.conversations.create("en");
+      expect((await Promise.all([a, b, c, d, e].map((x) => repos.conversations.get(x.id)))).map((x) => x !== null)).toEqual([
+        false,
+        false,
+        false,
+        true,
+        true,
+      ]);
+      expect(store.size).toBe(2);
+    });
+  });
 });
 
 describe.skipIf(!process.env.DATABASE_URL)("postgres repositories", () => {

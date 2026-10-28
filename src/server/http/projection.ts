@@ -10,10 +10,12 @@
 import type {
   ConversationMessageView,
   ConversationView,
+  Locale,
   Recommendation,
   ToolCallView,
 } from "@/shared/contracts";
 import type { StoredConversation, StoredMessage, StoredToolCall } from "@/server/repositories/types";
+import { summarizeToolFailure, summarizeToolOutput } from "@/server/agent/tool-summary";
 
 type TextBlock = { type: "text"; text: string };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string };
@@ -44,31 +46,13 @@ function joinText(content: unknown[]): string {
 }
 
 /**
- * Short, human-readable outcome of a tool call for the activity chip. Shapes
- * follow docs/AGENT.md; anything unexpected degrades to "ok"/"error" instead
- * of throwing, because tool outputs are owned by the agent module.
+ * Short, human-readable outcome of a tool call for the activity chip: the
+ * same text the live `tool_result` event carried (tool-summary.ts), so a
+ * reloaded conversation matches what the patient saw while it streamed.
+ * Failures show the executor's short label, never the model-facing error.
  */
-export function summarizeToolCall(call: StoredToolCall): string {
-  const output = isRecord(call.output) ? call.output : {};
-  if (call.isError) {
-    const reason = typeof output.message === "string" ? output.message : typeof output.error === "string" ? output.error : "";
-    return reason ? `error: ${reason}` : "error";
-  }
-  switch (call.toolName) {
-    case "assess_urgency":
-      return typeof output.urgency === "string" ? output.urgency : "ok";
-    case "search_providers": {
-      const results = Array.isArray(output.results) ? output.results.length : null;
-      const total = typeof output.total === "number" ? output.total : results;
-      return results === null ? "ok" : `${results} of ${total ?? results} providers`;
-    }
-    case "get_provider_details":
-      return typeof output.nameEn === "string" ? output.nameEn : "ok";
-    case "recommend_next_step":
-      return "recommendation saved";
-    default:
-      return "ok";
-  }
+export function summarizeToolCall(call: StoredToolCall, locale: Locale): string {
+  return call.isError ? summarizeToolFailure(call.output) : summarizeToolOutput(call.toolName, call.output, locale);
 }
 
 function recommendationIdFrom(call: StoredToolCall): string | null {
@@ -97,7 +81,7 @@ export function toConversationView(
   const toToolCallView = (block: ToolUseBlock): ToolCallView => {
     const call = callsByToolUseId.get(block.id);
     return call
-      ? { id: block.id, name: call.toolName, ok: !call.isError, summary: summarizeToolCall(call) }
+      ? { id: block.id, name: call.toolName, ok: !call.isError, summary: summarizeToolCall(call, conversation.locale) }
       : { id: block.id, name: block.name, ok: false, summary: "no result recorded" };
   };
 
@@ -122,12 +106,17 @@ export function toConversationView(
 
   const flushTurn = (endedAt: number): void => {
     if (!turn) return;
-    views.push({
-      role: "assistant",
-      text: turn.texts.join("\n\n"),
-      toolCalls: turn.toolUses.map(toToolCallView),
-      recommendation: findRecommendation(turn, endedAt),
-    });
+    const recommendation = findRecommendation(turn, endedAt);
+    // A patient message whose model call failed (or was retried) has no reply;
+    // rendering an empty bubble for it would look like a broken answer.
+    if (turn.texts.length > 0 || turn.toolUses.length > 0 || recommendation) {
+      views.push({
+        role: "assistant",
+        text: turn.texts.join("\n\n"),
+        toolCalls: turn.toolUses.map(toToolCallView),
+        recommendation,
+      });
+    }
     turn = null;
   };
 

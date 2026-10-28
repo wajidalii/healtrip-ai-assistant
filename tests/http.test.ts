@@ -5,7 +5,7 @@ import type { StoredConversation, StoredMessage, StoredToolCall } from "@/server
 import { AppError, badRequest, conflict, rateLimited, toErrorResponse } from "@/server/http/errors";
 import { toConversationView } from "@/server/http/projection";
 import { SlidingWindowRateLimiter, getClientIp } from "@/server/http/rate-limit";
-import { parseProviderSearchQuery, readJson } from "@/server/http/request";
+import { parseConversationId, parseProviderSearchQuery, readJson } from "@/server/http/request";
 import { createSseResponse, encodeEvent } from "@/server/http/sse";
 
 // ---------------------------------------------------------------------------
@@ -261,6 +261,16 @@ describe("readJson", () => {
   });
 });
 
+describe("parseConversationId", () => {
+  it("accepts only v4 UUIDs (the ids the server generates) and reports anything else as not found", () => {
+    expect(parseConversationId(" 11111111-1111-4111-8111-111111111111 ")).toBe("11111111-1111-4111-8111-111111111111");
+    expect(parseConversationId("11111111-1111-4111-8111-111111111111".toUpperCase())).toBe("11111111-1111-4111-8111-111111111111");
+    for (const bad of ["11111111-1111-1111-8111-111111111111", "11111111-1111-4111-c111-111111111111", "abc", ""]) {
+      expect(() => parseConversationId(bad)).toThrow(AppError);
+    }
+  });
+});
+
 describe("parseProviderSearchQuery", () => {
   it("coerces booleans and limit from query strings", () => {
     const query = parseProviderSearchQuery(
@@ -406,7 +416,7 @@ describe("toConversationView", () => {
   ];
 
   const toolCalls = [
-    call("tu1", "assess_urgency", { urgency: "urgent", must_call_emergency_services: false }),
+    call("tu1", "assess_urgency", { urgency: "urgent", must_call_emergency_services: false, suggested_specialties: ["cardiology"] }),
     call("tu2", "search_providers", { results: [{ id: "p1" }, { id: "p2" }], total: 7 }),
     call("tu3", "recommend_next_step", { ok: true, recommendation_id: recommendation.id }),
   ];
@@ -424,10 +434,11 @@ describe("toConversationView", () => {
     expect(turn.role).toBe("assistant");
     if (turn.role !== "assistant") return;
     expect(turn.text).toBe("Let me check how urgent this is.\n\nYou should be seen today.");
+    // Same strings the live tool_result events carried (tool-summary.ts).
     expect(turn.toolCalls).toEqual([
-      { id: "tu1", name: "assess_urgency", ok: true, summary: "urgent" },
-      { id: "tu2", name: "search_providers", ok: true, summary: "2 of 7 providers" },
-      { id: "tu3", name: "recommend_next_step", ok: true, summary: "recommendation saved" },
+      { id: "tu1", name: "assess_urgency", ok: true, summary: "urgent - cardiology" },
+      { id: "tu2", name: "search_providers", ok: true, summary: "2 of 7 providers found" },
+      { id: "tu3", name: "recommend_next_step", ok: true, summary: "Recommendation saved" },
     ]);
     expect(turn.recommendation).toEqual(recommendation);
 
@@ -447,14 +458,40 @@ describe("toConversationView", () => {
     expect(second.role === "assistant" && second.recommendation?.id).toBe(later.id);
   });
 
-  it("marks failed and unrecorded tool calls", () => {
-    const failed = [call("tu1", "assess_urgency", { message: "invalid input" }, true)];
+  it("marks failed and unrecorded tool calls without exposing the model-facing error text", () => {
+    const failed = [
+      call("tu1", "assess_urgency", { error: "Invalid input for assess_urgency: symptoms: Too small", summary: "Invalid tool input" }, true),
+      call("tu2", "search_providers", { error: "legacy row without a summary" }, true),
+    ];
     const view = toConversationView(conversation, messages.slice(0, 4), failed, []);
     const turn = view.messages[1];
     expect(turn.role === "assistant" && turn.toolCalls).toEqual([
-      { id: "tu1", name: "assess_urgency", ok: false, summary: "error: invalid input" },
-      { id: "tu2", name: "search_providers", ok: false, summary: "no result recorded" },
+      { id: "tu1", name: "assess_urgency", ok: false, summary: "Invalid tool input" },
+      { id: "tu2", name: "search_providers", ok: false, summary: "error" },
       { id: "tu3", name: "recommend_next_step", ok: false, summary: "no result recorded" },
+    ]);
+  });
+
+  it("uses the Arabic provider name for an Arabic conversation, like the live event", () => {
+    const details = [call("tu2", "get_provider_details", { id: "p1", nameEn: "Dr. Elif Kaya", nameAr: "د. إيليف كايا" })];
+    const view = toConversationView({ ...conversation, locale: "ar" }, messages.slice(0, 5), details, []);
+    const turn = view.messages[1];
+    expect(turn.role === "assistant" && turn.toolCalls[1].summary).toBe("د. إيليف كايا");
+  });
+
+  it("skips the assistant entry for a patient message that got no reply (failed or retried turn)", () => {
+    const retried = [
+      msg("user", [{ type: "text", text: "I have chest pain" }], "2026-01-01T00:01:00Z"),
+      msg("user", [{ type: "text", text: "I have chest pain" }], "2026-01-01T00:01:05Z"),
+      msg("assistant", [{ type: "text", text: "How long has it lasted?" }], "2026-01-01T00:01:06Z"),
+      msg("user", [{ type: "text", text: "Two hours" }], "2026-01-01T00:01:20Z"),
+    ];
+    const view = toConversationView(conversation, retried, [], []);
+    expect(view.messages).toEqual([
+      { role: "user", text: "I have chest pain" },
+      { role: "user", text: "I have chest pain" },
+      { role: "assistant", text: "How long has it lasted?", toolCalls: [], recommendation: null },
+      { role: "user", text: "Two hours" },
     ]);
   });
 

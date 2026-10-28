@@ -1,7 +1,17 @@
 "use client";
 
-import type { ProviderSummary } from "@/shared/contracts";
+import type { Locale, ProviderSummary } from "@/shared/contracts";
 import { useLocale } from "@/i18n/locale";
+
+/** Localised country name for an ISO alpha-2 code; falls back to the code itself. */
+export function countryName(locale: Locale, code: string): string {
+  try {
+    return new Intl.DisplayNames([locale], { type: "region" }).of(code) ?? code;
+  } catch {
+    // Older runtimes without Intl.DisplayNames, or a code outside ISO 3166.
+    return code;
+  }
+}
 
 /**
  * Renders a provider row exactly as the server returned it from the database.
@@ -16,7 +26,9 @@ export function ProviderCard({ provider }: { provider: ProviderSummary }) {
         <div>
           <h4 className="font-semibold text-zinc-900">{name}</h4>
           <p className="text-xs text-zinc-600">
-            {t.providerKind[provider.kind]} · {provider.city}, {provider.country}
+            {t.providerKind[provider.kind]} · {provider.city}
+            {t.listSeparator}
+            {countryName(locale, provider.country)}
           </p>
         </div>
         <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
@@ -29,11 +41,11 @@ export function ProviderCard({ provider }: { provider: ProviderSummary }) {
       <dl className="mt-2 space-y-1 text-xs text-zinc-700">
         <div className="flex gap-1">
           <dt className="font-medium">{t.provider.specialties}:</dt>
-          <dd>{provider.specialties.map((s) => t.specialties[s]).join("، ")}</dd>
+          <dd>{provider.specialties.map((s) => t.specialties[s]).join(t.listSeparator)}</dd>
         </div>
         <div className="flex gap-1">
           <dt className="font-medium">{t.provider.languages}:</dt>
-          <dd>{provider.languages.map((l) => t.languages[l]).join("، ")}</dd>
+          <dd>{provider.languages.map((l) => t.languages[l]).join(t.listSeparator)}</dd>
         </div>
       </dl>
 

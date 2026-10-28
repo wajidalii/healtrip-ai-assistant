@@ -33,9 +33,11 @@ export function RecommendationCard({ recommendation }: { recommendation: Recomme
         ) : null}
       </div>
 
+      {/* Model prose follows the patient's language, which may differ from the UI
+          locale, so each free-text run resolves its own direction. */}
       <p className="mt-3 text-sm text-zinc-800">
         <span className="font-medium">{t.recommendation.rationale}: </span>
-        {recommendation.rationale}
+        <span dir="auto">{recommendation.rationale}</span>
       </p>
 
       {recommendation.questionsRemaining.length > 0 ? (
@@ -43,7 +45,9 @@ export function RecommendationCard({ recommendation }: { recommendation: Recomme
           <p className="font-medium">{t.recommendation.questionsRemaining}:</p>
           <ul className="mt-1 list-disc space-y-0.5 ps-5">
             {recommendation.questionsRemaining.map((q, i) => (
-              <li key={i}>{q}</li>
+              <li key={i} dir="auto" className="text-start">
+                {q}
+              </li>
             ))}
           </ul>
         </div>

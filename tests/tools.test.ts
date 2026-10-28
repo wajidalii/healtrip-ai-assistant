@@ -9,6 +9,7 @@ import {
 import { createMemoryRepositories } from "@/server/repositories/memory";
 import type { Repositories } from "@/server/repositories/types";
 import { GroundingSet } from "@/server/agent/grounding";
+import { UrgencyRecord } from "@/server/agent/urgency-record";
 import { TOOL_DEFINITIONS, TOOL_NAMES, executeTool, type ToolContext } from "@/server/agent/tools";
 
 const CARDIOLOGIST_ISTANBUL = "41d456cd-2271-48aa-a326-fbf9818757b3"; // Dr. Elif Kaya
@@ -81,7 +82,13 @@ describe("executeTool", () => {
   beforeEach(async () => {
     repos = createMemoryRepositories();
     const conversation = await repos.conversations.create("en");
-    ctx = { conversationId: conversation.id, repos, grounding: new GroundingSet(), locale: "en" };
+    ctx = {
+      conversationId: conversation.id,
+      repos,
+      grounding: new GroundingSet(),
+      urgency: new UrgencyRecord(),
+      locale: "en",
+    };
   });
 
   it("rejects unknown tools and invalid input with ok:false", async () => {
@@ -158,7 +165,18 @@ describe("executeTool", () => {
   });
 
   describe("get_provider_details", () => {
+    it("rejects an id the model never received from a search, listing the allowed ones", async () => {
+      ctx.grounding.add([INACTIVE_DERMATOLOGIST]);
+      const res = await executeTool("get_provider_details", { provider_id: CARDIOLOGIST_ISTANBUL }, ctx);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.summary).toBe("Rejected: unknown provider id");
+      expect(res.error).toContain(`Allowed ids: [${INACTIVE_DERMATOLOGIST}]`);
+      expect(ctx.grounding.has(CARDIOLOGIST_ISTANBUL)).toBe(false);
+    });
+
     it("returns the full record and grounds the id", async () => {
+      ctx.grounding.add([CARDIOLOGIST_ISTANBUL]);
       const res = await executeTool("get_provider_details", { provider_id: CARDIOLOGIST_ISTANBUL }, ctx);
       expect(res.ok).toBe(true);
       if (!res.ok) return;
@@ -168,6 +186,7 @@ describe("executeTool", () => {
     });
 
     it("uses the Arabic name as summary for ar locale", async () => {
+      ctx.grounding.add([CARDIOLOGIST_ISTANBUL]);
       const res = await executeTool("get_provider_details", { provider_id: CARDIOLOGIST_ISTANBUL }, {
         ...ctx,
         locale: "ar",
@@ -176,11 +195,13 @@ describe("executeTool", () => {
     });
 
     it("fails for unknown or inactive providers without grounding them", async () => {
+      ctx.grounding.add([UNKNOWN_ID, INACTIVE_DERMATOLOGIST]); // a stale grounding row
       const missing = await executeTool("get_provider_details", { provider_id: UNKNOWN_ID }, ctx);
       expect(missing.ok).toBe(false);
+      expect(!missing.ok && missing.summary).toBe("Provider not found");
       const inactive = await executeTool("get_provider_details", { provider_id: INACTIVE_DERMATOLOGIST }, ctx);
       expect(inactive.ok).toBe(false);
-      expect(ctx.grounding.size).toBe(0);
+      expect(ctx.grounding.size).toBe(2);
       const badFormat = await executeTool("get_provider_details", { provider_id: "abc" }, ctx);
       expect(badFormat.ok).toBe(false);
     });
@@ -193,6 +214,57 @@ describe("executeTool", () => {
       specialty: "cardiology",
       rationale_for_patient: RATIONALE,
     };
+
+    beforeEach(() => {
+      ctx.urgency.record("urgent");
+    });
+
+    it("rejects a recommendation before assess_urgency has run", async () => {
+      const fresh: ToolContext = { ...ctx, urgency: new UrgencyRecord() };
+      const res = await executeTool("recommend_next_step", { ...base, provider_ids: [] }, fresh);
+      expect(res.ok).toBe(false);
+      if (res.ok) return;
+      expect(res.summary).toBe("Rejected: urgency not assessed");
+      expect(res.error).toContain("assess_urgency");
+      expect(await repos.conversations.listRecommendations(ctx.conversationId)).toEqual([]);
+    });
+
+    it("rejects an urgency that differs from the engine's latest decision, in either direction", async () => {
+      const assessed = await executeTool(
+        "assess_urgency",
+        { symptoms: ["chest pain"], red_flags: ["shortness_of_breath"] },
+        ctx,
+      );
+      expect(assessed.ok && (assessed.output as { urgency: string }).urgency).toBe("emergency");
+      expect(ctx.urgency.latest).toBe("emergency");
+
+      const downgraded = await executeTool(
+        "recommend_next_step",
+        { ...base, next_step: "self_care_monitor", urgency: "self_care", specialty: null, provider_ids: [] },
+        ctx,
+      );
+      expect(downgraded.ok).toBe(false);
+      if (downgraded.ok) return;
+      expect(downgraded.summary).toBe("Rejected: urgency differs from the engine");
+      expect(downgraded.error).toContain("'emergency'");
+      expect(downgraded.error).toContain("'self_care'");
+
+      ctx.urgency.record("routine");
+      const escalated = await executeTool(
+        "recommend_next_step",
+        { ...base, next_step: "emergency_now", urgency: "emergency", provider_ids: [] },
+        ctx,
+      );
+      expect(escalated.ok).toBe(false);
+      expect(await repos.conversations.listRecommendations(ctx.conversationId)).toEqual([]);
+
+      const matching = await executeTool(
+        "recommend_next_step",
+        { ...base, next_step: "primary_care", urgency: "routine", provider_ids: [] },
+        ctx,
+      );
+      expect(matching.ok).toBe(true);
+    });
 
     it("rejects ungrounded provider ids and lists the allowed ones", async () => {
       ctx.grounding.add([CARDIOLOGIST_ISTANBUL]);
@@ -223,6 +295,7 @@ describe("executeTool", () => {
     });
 
     it("accepts zero providers and a null specialty (e.g. self-care)", async () => {
+      ctx.urgency.record("self_care");
       const res = await executeTool(
         "recommend_next_step",
         {
@@ -245,12 +318,14 @@ describe("executeTool", () => {
         ctx,
       );
       expect(mismatch.ok).toBe(false);
+      ctx.urgency.record("emergency");
       const mismatch2 = await executeTool(
         "recommend_next_step",
         { ...base, urgency: "emergency", provider_ids: [] },
         ctx,
       );
       expect(mismatch2.ok).toBe(false);
+      expect(!mismatch2.ok && mismatch2.summary).toBe("Rejected: urgency and next step disagree");
     });
 
     it("validates bounds: too many ids, short rationale, too many questions", async () => {

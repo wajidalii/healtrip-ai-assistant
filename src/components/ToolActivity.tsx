@@ -17,7 +17,7 @@ export function ToolActivity({ items }: { items: ToolActivityItem[] }) {
   const { t } = useLocale();
   if (items.length === 0) return null;
   return (
-    <ul className="flex flex-wrap gap-1.5" aria-label={t.assistant}>
+    <ul className="flex flex-wrap gap-1.5" aria-label={t.toolActivity}>
       {items.map((item) => {
         // Unknown tool names (future tools) fall back to the raw name rather than crashing.
         const label = isToolName(item.name) ? t.toolLabels[item.name] : item.name;

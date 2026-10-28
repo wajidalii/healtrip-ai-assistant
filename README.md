@@ -34,7 +34,7 @@ preventing the model from inventing providers that do not exist in the database.
 ## Quick start
 
 ```bash
-cp .env.example .env            # add ANTHROPIC_API_KEY; DATABASE_URL is optional
+cp .env.example .env            # add ANTHROPIC_API_KEY (or AI_GATEWAY_API_KEY); DATABASE_URL is optional
 npm install
 npm run dev                     # http://localhost:3000  (in-memory DB if DATABASE_URL is unset)
 ```
@@ -55,12 +55,27 @@ Environment variables (all parsed once by `src/server/config.ts`; see `.env.exam
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | unset | Required only for the agent; everything else runs without it |
-| `CLAUDE_MODEL` | `claude-opus-5-5` | Model id passed to the API |
+| `ANTHROPIC_API_KEY` | unset | Direct Anthropic API (`mode: anthropic`). Only the agent needs credentials; everything else runs without them |
+| `AI_GATEWAY_API_KEY` | unset | Vercel AI Gateway key (`mode: gateway-key`), used when `ANTHROPIC_API_KEY` is unset |
+| `VERCEL` | set by Vercel | With neither key set, selects `mode: gateway-oidc` (AI Gateway with the deployment's OIDC token); not meant to be set by hand |
+| `CLAUDE_MODEL` | `claude-opus-5-5` | Model id; mapped to a `provider/model` slug in the gateway modes (see below) |
 | `CLAUDE_EFFORT` | `low` | `output_config.effort`: `low`, `medium`, `high`, `xhigh`, `max` |
 | `AGENT_MAX_STEPS` | `6` | Model calls per user message (1–10) |
 | `DATABASE_URL` | unset | Postgres URL; unset selects the in-memory repository |
 | `RATE_LIMIT_PER_MINUTE` | `20` | Messages per IP per minute |
+
+### Credential modes
+
+`src/server/agent/claude.ts` picks one of three ways to reach the model from the environment, in this order; `GET /api/health` reports the chosen `mode` and the effective `model` (never a credential):
+
+| Mode | When | Request | Vercel env vars needed |
+| --- | --- | --- | --- |
+| `anthropic` | `ANTHROPIC_API_KEY` set | `api.anthropic.com`, `fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta | `ANTHROPIC_API_KEY` |
+| `gateway-key` | else `AI_GATEWAY_API_KEY` set | `https://ai-gateway.vercel.sh` with the key; no `betas`/`fallbacks` | `AI_GATEWAY_API_KEY` |
+| `gateway-oidc` | else running on Vercel | same URL, bearer token from `getVercelOidcToken()` (`@vercel/functions`) resolved per turn; no `betas`/`fallbacks` | none (enable "Secure Backend Access with OIDC Federation" in the project settings and AI Gateway on the team) |
+| `unconfigured` | none of the above | the agent refuses with a generic `upstream_error`; the rest of the app works | — |
+
+In the gateway modes `CLAUDE_MODEL` is mapped to a gateway slug: a fixed table (`claude-opus-5-5` → `anthropic/claude-opus-5.5`, same for `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-opus-5`, `claude-sonnet-5`), otherwise `anthropic/` + the id with a trailing `-N-N` rewritten to `-N.N`; a value containing `/` is used verbatim. `output_config.effort`, strict tools and prompt caching are unchanged in every mode. Local OIDC: `vercel env pull` writes a short-lived `VERCEL_OIDC_TOKEN`; set `VERCEL=1` as well to select the mode off-platform. `npm run eval` still requires `ANTHROPIC_API_KEY`.
 
 ## How it works (30-second version)
 
@@ -91,7 +106,7 @@ Then `tests/run-turn.test.ts` shows the loop end-to-end with a scripted fake Cla
 - **Decision support, not diagnosis.** The assistant triages and routes; it never names a condition as fact or prescribes. Every recommendation ends with a not-medical-advice line and emergencies short-circuit to "call local emergency services now".
 - **Synthetic data.** The 33 providers (hospitals, clinics, doctors across nine cities) are fictional: names, ratings, accreditations and languages are invented. No real hospital or doctor is represented.
 - **No authentication.** Conversations are stored server-side keyed by an unguessable v4 UUID. That is not access control; [docs/SECURITY.md](docs/SECURITY.md) lists what production adds.
-- **Model and cost knobs.** `CLAUDE_MODEL`, `CLAUDE_EFFORT` (default `low` for chat latency) and `AGENT_MAX_STEPS` (default 6) are env vars. The static prompt and tool list are prompt-cached; `fallbacks: "default"` lets a safety-classifier decline be served by Anthropic's fallback model.
+- **Model and cost knobs.** `CLAUDE_MODEL`, `CLAUDE_EFFORT` (default `low` for chat latency) and `AGENT_MAX_STEPS` (default 6) are env vars. The static prompt and tool list are prompt-cached; `fallbacks: "default"` lets a safety-classifier decline be served by Anthropic's fallback model (direct-API mode only; see "Credential modes").
 - **Memory vs Postgres.** Without `DATABASE_URL` the app runs on an in-memory repository seeded with the same data, so the UI, API and tests work with zero setup; conversations then live only as long as the process. With Postgres the same repository interface is backed by Drizzle, and the shared repository test suite runs against both.
 - **What the eval covers.** `npm run eval` runs scripted scenarios (chest pain with red flags, chest pain without, a routine dermatology case, a city with no coverage) against the real model and checks urgency/next-step/specialty expectations and provider grounding (every recommended id came from a tool; prose names no provider the tools did not return), and prints the transcript (`--json`, `--only <id>`). It needs `ANTHROPIC_API_KEY`; the vitest suite does not.
 - **Where the time went.** The backend (agent loop, grounding, rule engine, HTTP layer) and its tests, plus the docs, over UI polish. The UI is functional, bilingual and RTL-aware but deliberately plain.

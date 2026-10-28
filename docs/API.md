@@ -31,8 +31,10 @@ Route handlers live in `src/app/api/**/route.ts` and are thin: parse → call `s
 ## GET /api/health
 
 ```json
-{ "ok": true, "repository": "memory" | "postgres", "model": "claude-opus-5-5", "version": "0.1.0" }
+{ "ok": true, "repository": "memory" | "postgres", "mode": "anthropic" | "gateway-key" | "gateway-oidc" | "unconfigured", "model": "claude-opus-5-5", "version": "0.1.0" }
 ```
+
+`mode` is the credential mode (README "Credential modes") and `model` the effective model id sent to the provider (a gateway slug such as `anthropic/claude-opus-5.5` in the gateway modes). No credential is ever included.
 
 ## GET /api/providers
 
@@ -67,7 +69,7 @@ Body: `{ "content": "I have chest pain…", "locale": "en" }` (`content` 1–200
 
 Checks, in order: id format (404) → body (400/413) → conversation exists (404) → rate limit (429) → turn lock (409). Then the response is `200 text/event-stream; charset=utf-8` (`Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`).
 
-Each frame is `event: <type>` + `data: <the whole AgentEvent as JSON>`; types and payloads are the `AgentEvent` union in `src/shared/contracts.ts`. The `conversation` event is always first. A `: heartbeat` comment is sent every 15 s of silence so proxies and the browser's 90 s inactivity timeout do not drop a long tool call.
+Each frame is `event: <type>` + `data: <the whole AgentEvent as JSON>`; types and payloads are the `AgentEvent` union in `src/shared/contracts.ts`. The `conversation` event is always first. A `: heartbeat` comment is sent every 15 s of silence so proxies and load balancers do not drop an idle connection during a long tool call. Heartbeats are transport-level only: the browser's SSE parser discards comment frames, so the UI's 90 s inactivity timeout measures silence between decoded *events*, not bytes on the wire. A turn whose model step emits no event for 90 s is aborted client-side as a retryable `Inactivity timeout` even if the server is still healthy.
 
 ```
 event: conversation

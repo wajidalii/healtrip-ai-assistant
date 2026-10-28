@@ -32,7 +32,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <head>
         <script dangerouslySetInnerHTML={{ __html: LOCALE_BOOT_SCRIPT }} />
       </head>
-      <body className="min-h-full flex flex-col bg-zinc-50 text-zinc-900">
+      {/* `h-full` (not `min-h-full`) bounds the page so the message list, not the
+          document, is the scroll container (see ChatWindow). */}
+      <body className="flex h-full flex-col bg-zinc-50 text-zinc-900">
         <LocaleProvider>{children}</LocaleProvider>
       </body>
     </html>

@@ -87,16 +87,44 @@ export class MemoryProviderRepository implements ProviderRepository {
 
 type ConversationRow = StoredConversation & { turnLockedUntil: number | null };
 
+/**
+ * Retention for the in-memory store, which otherwise grows until the process
+ * dies (an unauthenticated loop over POST /api/conversations is enough).
+ * Postgres keeps everything; a retention job there is listed as future work.
+ */
+export type MemoryRetentionOptions = {
+  /** Conversations idle for longer than this are dropped on the next create. */
+  idleTtlMs?: number;
+  /** Hard cap; the least recently updated conversations are dropped to stay under it. */
+  maxConversations?: number;
+  /** Injectable clock for tests. */
+  now?: () => number;
+};
+
+const DEFAULT_IDLE_TTL_MS = 60 * 60 * 1000;
+const DEFAULT_MAX_CONVERSATIONS = 1_000;
+
 export class MemoryConversationRepository implements ConversationRepository {
   private readonly conversations = new Map<string, ConversationRow>();
   private readonly messages = new Map<string, StoredMessage[]>();
   private readonly toolCalls = new Map<string, StoredToolCall[]>();
   private readonly recommendations = new Map<string, Recommendation[]>();
+  private readonly idleTtlMs: number;
+  private readonly maxConversations: number;
+  private readonly now: () => number;
 
-  constructor(private readonly providers: ProviderRepository) {}
+  constructor(
+    private readonly providers: ProviderRepository,
+    retention: MemoryRetentionOptions = {},
+  ) {
+    this.idleTtlMs = retention.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
+    this.maxConversations = retention.maxConversations ?? DEFAULT_MAX_CONVERSATIONS;
+    this.now = retention.now ?? Date.now;
+  }
 
   async create(locale: Locale): Promise<StoredConversation> {
-    const now = new Date();
+    this.evict();
+    const now = new Date(this.now());
     const row: ConversationRow = {
       id: randomUUID(),
       locale,
@@ -130,12 +158,17 @@ export class MemoryConversationRepository implements ConversationRepository {
       seq: list.length,
       role,
       content: structuredClone(content),
-      createdAt: new Date(),
+      createdAt: new Date(this.now()),
     };
     list.push(message);
     this.messages.set(conversationId, list);
     row.updatedAt = message.createdAt;
     return structuredClone(message);
+  }
+
+  /** Conversations currently stored (exposed for tests and metrics). */
+  get size(): number {
+    return this.conversations.size;
   }
 
   async listMessages(conversationId: string): Promise<StoredMessage[]> {
@@ -144,7 +177,7 @@ export class MemoryConversationRepository implements ConversationRepository {
 
   async recordToolCall(call: Omit<StoredToolCall, "id" | "createdAt">): Promise<StoredToolCall> {
     this.requireConversation(call.conversationId);
-    const stored: StoredToolCall = { ...structuredClone(call), id: randomUUID(), createdAt: new Date() };
+    const stored: StoredToolCall = { ...structuredClone(call), id: randomUUID(), createdAt: new Date(this.now()) };
     this.toolCalls.get(call.conversationId)?.push(stored);
     return structuredClone(stored);
   }
@@ -164,7 +197,7 @@ export class MemoryConversationRepository implements ConversationRepository {
       rationale: rec.rationale,
       providers,
       questionsRemaining: [...rec.questionsRemaining],
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(this.now()).toISOString(),
     };
     this.recommendations.get(rec.conversationId)?.push(stored);
     return structuredClone(stored);
@@ -177,7 +210,7 @@ export class MemoryConversationRepository implements ConversationRepository {
   async tryAcquireTurnLock(conversationId: string, ttlMs: number): Promise<boolean> {
     const row = this.conversations.get(conversationId);
     if (!row) return false;
-    const now = Date.now();
+    const now = this.now();
     if (row.turnLockedUntil !== null && row.turnLockedUntil >= now) return false;
     row.turnLockedUntil = now + ttlMs;
     return true;
@@ -186,6 +219,32 @@ export class MemoryConversationRepository implements ConversationRepository {
   async releaseTurnLock(conversationId: string): Promise<void> {
     const row = this.conversations.get(conversationId);
     if (row) row.turnLockedUntil = null;
+  }
+
+  /**
+   * Drops idle conversations, then the least recently updated ones over the cap.
+   * A conversation whose turn lock is held is never dropped: its turn is still
+   * appending to it. Runs on create, the only call that grows the store.
+   */
+  private evict(): void {
+    const now = this.now();
+    const unlocked = (row: ConversationRow): boolean => row.turnLockedUntil === null || row.turnLockedUntil < now;
+    for (const row of this.conversations.values()) {
+      if (unlocked(row) && row.updatedAt.getTime() < now - this.idleTtlMs) this.remove(row.id);
+    }
+    const excess = this.conversations.size - (this.maxConversations - 1);
+    if (excess <= 0) return;
+    const oldestFirst = [...this.conversations.values()]
+      .filter(unlocked)
+      .sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
+    for (const row of oldestFirst.slice(0, excess)) this.remove(row.id);
+  }
+
+  private remove(id: string): void {
+    this.conversations.delete(id);
+    this.messages.delete(id);
+    this.toolCalls.delete(id);
+    this.recommendations.delete(id);
   }
 
   private requireConversation(id: string): ConversationRow {
@@ -207,11 +266,12 @@ export class MemoryConversationRepository implements ConversationRepository {
 
 export function createMemoryRepositories(
   providers: readonly Provider[] = SEED_PROVIDERS,
+  retention: MemoryRetentionOptions = {},
 ): Repositories {
   const providerRepo = new MemoryProviderRepository(providers);
   return {
     kind: "memory",
     providers: providerRepo,
-    conversations: new MemoryConversationRepository(providerRepo),
+    conversations: new MemoryConversationRepository(providerRepo, retention),
   };
 }

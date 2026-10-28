@@ -39,7 +39,11 @@ const en = {
   thinking: "Thinking…",
   retry: "Retry",
   startNewHint: "This conversation cannot continue. Please start a new conversation.",
+  /** Western digits everywhere (counter, ratings, tool summaries and copy), the usual choice in medical UIs. */
   charCount: (used: number, max: number) => `${used} / ${max}`,
+  /** Joins short enumerations (specialties, languages, "city, country"). */
+  listSeparator: ", ",
+  toolActivity: "What the assistant checked",
   samplePromptsTitle: "Try an example",
   samplePrompts: [
     "I have chest pain and I’m not sure whether I should see a cardiologist, go to the ER, or seek a second opinion.",
@@ -135,6 +139,7 @@ const en = {
     maxTokens: "The answer was cut short. Please ask the assistant to continue.",
     refusal: "The assistant could not answer this request. Please rephrase or ask something else.",
     upstream: "The AI service is temporarily unavailable. Please try again.",
+    upstreamUnavailable: "The AI service is not available on this server right now.",
     conversationLoad: "Could not restore your previous conversation.",
   },
   localeToggle: { label: "Language", switchTo: "العربية" },
@@ -169,10 +174,12 @@ const ar: Dictionary = {
   retry: "إعادة المحاولة",
   startNewHint: "لا يمكن متابعة هذه المحادثة. يرجى بدء محادثة جديدة.",
   charCount: (used, max) => `${used} / ${max}`,
+  listSeparator: "، ",
+  toolActivity: "ما تحقق منه المساعد",
   samplePromptsTitle: "جرّب مثالًا",
   samplePrompts: [
     "أشعر بألم في الصدر ولست متأكدًا هل أراجع طبيب قلب، أم أتوجه إلى الطوارئ، أم أطلب رأيًا طبيًا ثانيًا.",
-    "ابنتي عمرها ست سنوات ولديها حمى ٣٩ درجة منذ يومين مع طفح جلدي على الصدر. نحن في دبي.",
+    "ابنتي عمرها ست سنوات ولديها حمى 39 درجة منذ يومين مع طفح جلدي على الصدر. نحن في دبي.",
     "شُخّصت بانزلاق غضروفي في القاهرة وأريد رأيًا ثانيًا من استشاري عظام يتحدث الإنجليزية.",
   ],
   toolLabels: {
@@ -184,7 +191,7 @@ const ar: Dictionary = {
   toolStatus: { running: "قيد التنفيذ", ok: "اكتمل", error: "فشل" },
   nextStepLabels: {
     emergency_now: "توجّه إلى الطوارئ فورًا",
-    urgent_care_24h: "اطلب رعاية عاجلة خلال ٢٤ ساعة",
+    urgent_care_24h: "اطلب رعاية عاجلة خلال 24 ساعة",
     specialist_consultation: "احجز استشارة مع طبيب مختص",
     second_opinion: "اطلب رأيًا طبيًا ثانيًا",
     primary_care: "راجع طبيب الرعاية الأولية",
@@ -264,6 +271,7 @@ const ar: Dictionary = {
     maxTokens: "انقطعت الإجابة قبل اكتمالها. يرجى الطلب من المساعد المتابعة.",
     refusal: "لم يتمكن المساعد من الإجابة عن هذا الطلب. يرجى إعادة الصياغة أو طرح سؤال آخر.",
     upstream: "خدمة الذكاء الاصطناعي غير متاحة مؤقتًا. يرجى المحاولة مرة أخرى.",
+    upstreamUnavailable: "خدمة الذكاء الاصطناعي غير متاحة على هذا الخادم حاليًا.",
     conversationLoad: "تعذّر استعادة محادثتك السابقة.",
   },
   localeToggle: { label: "اللغة", switchTo: "English" },
