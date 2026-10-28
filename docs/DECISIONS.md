@@ -12,12 +12,12 @@
 
 ## ADR-3: Deterministic rule engine decides urgency; the model extracts facts
 **Context.** Consistency and reviewability matter more than nuance for red-flag triage.
-**Decision.** `assess_urgency` is a data-driven rule table (`src/server/triage/rules.ts`). The model must call it and must not override its result in the stored recommendation.
-**Consequences.** Clinically reviewable, unit-testable; some edge cases will be conservative (over-triage), which is the safer failure mode. Symptom matching is regex-based on the model's English paraphrase, which is good enough for a prototype and obviously replaceable.
+**Decision.** `assess_urgency` is a data-driven rule table (`src/server/triage/rules.ts`). The model must call it and cannot override its result: `recommend_next_step` is rejected unless `assess_urgency` has run in the conversation and `input.urgency` equals the engine's latest value, which `UrgencyRecord` (`src/server/agent/urgency-record.ts`) rebuilds from the `tool_calls` audit table on every turn, the same way the grounding set is rebuilt. The only way for the model to change the urgency is to call the engine again with new facts.
+**Consequences.** Clinically reviewable, unit-testable, and enforced rather than requested: patient text or a provider description cannot talk a red-flag case down to self-care. Some edge cases will be conservative (over-triage), which is the safer failure mode. Symptom matching is regex-based on the model's English paraphrase, which is good enough for a prototype and obviously replaceable.
 
 ## ADR-4: Grounding enforced at the single exit tool, and cards rendered from DB rows
 **Context.** The brief explicitly asks how we stop the model inventing data.
-**Decision.** Only `recommend_next_step` can produce a recommendation; its provider ids must be in the set the model fetched (rebuilt from the `tool_calls` audit table each turn); the server hydrates providers by id and the UI renders only those rows.
+**Decision.** Only `recommend_next_step` can produce a recommendation; its provider ids must be in the set the model fetched (rebuilt from the `tool_calls` audit table each turn); `get_provider_details` accepts only ids already in that set, so a guessed or user-pasted id cannot be laundered into it; the server hydrates providers by id and the UI renders only those rows.
 **Consequences.** A hallucinated provider can at most appear as prose, never as a card or stored recommendation.
 
 ## ADR-5: Postgres via Drizzle plus an in-memory repository with the same seed data
@@ -27,8 +27,8 @@
 
 ## ADR-6: Claude `claude-opus-5-5`, low effort, prompt caching, server-side fallbacks
 **Context.** Chat latency matters; safety classifiers can decline medical content; cost should be predictable.
-**Decision.** Opus 5.5 with `output_config.effort = "low"` (configurable), a static cached system block with the tool list in a fixed order, `fallbacks: "default"`.
-**Consequences.** Good reasoning quality with low time-to-first-token; a declined request is served by a fallback model rather than failing; model and effort are swappable by env var.
+**Decision.** Opus 5.5 with `output_config.effort = "low"` (configurable), `max_tokens` scaled by effort (`MAX_TOKENS_BY_EFFORT`: 8192 at `low` up to 64 000 at `xhigh`/`max`, since thinking counts toward it), a static cached system block with the tool list in a fixed order plus a top-level `cache_control` breakpoint on the growing history, `fallbacks: "default"`.
+**Consequences.** Good reasoning quality with low time-to-first-token; a declined request is served by a fallback model rather than failing; model and effort are swappable by env var, and raising the effort raises the output ceiling and the turn-lock TTL budget with it rather than truncating replies.
 
 ## ADR-7: Server-side conversation state
 **Context.** Append-only history is required for caching and preserved-thinking; the UI should be reload-safe; auditability of tool calls is a requirement of the brief.
@@ -47,9 +47,22 @@
 - English and Arabic UI; the agent answers in the user's language and can handle other languages in free text.
 - No authentication, payments, booking or medical records in scope.
 - "Second opinion" is modelled as a next step that routes to a specialist of the same specialty, flagged `second_opinion` so a product could later attach records-review workflows.
-- Rate limiting is per process; the turn lock is per conversation row (DB) or per process (memory mode).
+- Rate limiting is per process; the turn lock is per conversation row (DB) or per process (memory mode), with a TTL of `AGENT_MAX_STEPS` × 60 s.
+- Memory mode keeps at most 1000 conversations and drops ones idle for over an hour; Postgres keeps everything until a retention job exists.
 - A retried turn re-sends the user message; the stored history may then contain it twice (see API.md).
 
 ## Deployment
 
-Target: Vercel (Node runtime; SSE streaming supported) with a Neon Postgres database from the Vercel Marketplace. Model credentials per ADR-8: either `ANTHROPIC_API_KEY` as a server env var, or `AI_GATEWAY_API_KEY`, or no key at all with OIDC federation enabled on the project (the deployment then authenticates to the AI Gateway with its own token; `VERCEL` is set by the platform). Without `DATABASE_URL` the deployment runs on the in-memory repository, which is acceptable for a demo but loses conversations on cold starts. Steps are in the README. GitHub Actions (`.github/workflows/ci.yml`) runs lint, typecheck, tests and build on every push and pull request to `main`; the tests need neither an API key nor a database.
+Live at **<https://healtrip.wajidali.dev>**: Vercel (Node runtime; SSE streaming supported), git-connected to `main` so every push deploys, with a Neon Postgres database from the Vercel Marketplace (`DATABASE_URL` injected by the integration; the schema and seed are applied with `npm run db:push` / `npm run db:seed` against that URL). Model credentials per ADR-8; the deployment currently runs in `gateway-oidc` mode, which has no secret to store.
+
+What works live today: the bilingual UI, conversation creation and reload, provider search against Postgres (`GET /api/providers`), `GET /api/health` (`repository: "postgres"`, `mode: "gateway-oidc"`), and the full SSE path up to the model call: a message opens the stream, the `conversation` event arrives, and the turn ends with a graceful terminal `error` (`upstream_error`, not retryable) that the UI shows in the user's language. What is missing is the model call itself: the AI Gateway returns "not configured / rejected" for the deployment's OIDC token until the Vercel team has AI Gateway billing enabled (or a key is set).
+
+To enable the assistant, set exactly one of these in the Vercel project (*Settings → Environment Variables*, Production scope) and redeploy:
+
+- `anthropic` mode: `ANTHROPIC_API_KEY` (mark it Sensitive). Highest precedence; direct API with server-side fallbacks.
+- `gateway-key` mode: `AI_GATEWAY_API_KEY` from the team's AI Gateway settings. Bills the team, no Anthropic secret on the project.
+- `gateway-oidc` mode: no variable; enable *Settings → Security → Secure Backend Access with OIDC Federation* on the project and AI Gateway billing on the team. This is the current configuration.
+
+Optional in every mode: `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `AGENT_MAX_STEPS`, `RATE_LIMIT_PER_MINUTE`. Without `DATABASE_URL` the deployment would run on the in-memory repository, acceptable for a demo but losing conversations on cold starts. Local setup steps are in the README.
+
+CI: `.github/workflows/ci.yml` runs lint, typecheck, tests and build on every push and pull request to `main`; the tests need neither an API key nor a database. The GitHub-hosted runs are currently refused by GitHub ("job was not started because recent account payments have failed"), so the Vercel build on every push is the effective gate until billing is sorted; the same four commands run locally in under a minute.

@@ -15,11 +15,12 @@ src/
     page.tsx                   # Chat page (renders <ChatWindow />)
     globals.css                # Tailwind import + Arabic-friendly font stack / RTL line-height
     api/
+      _lib/route-error.ts      # Catch-all for handlers: rethrows Next's internal signals, then toErrorResponse
       health/route.ts          # GET  /api/health
       providers/route.ts       # GET  /api/providers?specialty=…
-      conversations/route.ts   # POST /api/conversations
+      conversations/route.ts   # POST /api/conversations  (rate limited)
       conversations/[id]/route.ts            # GET  /api/conversations/:id
-      conversations/[id]/messages/route.ts   # POST /api/conversations/:id/messages  (SSE)
+      conversations/[id]/messages/route.ts   # POST /api/conversations/:id/messages  (SSE, turn lock)
   components/                  # Chat UI (client components)
     ChatWindow.tsx             # Header, message log, emergency banner, composer, disclaimer
     MessageBubble.tsx          # User/assistant bubbles, inline error + retry
@@ -53,27 +54,39 @@ src/
     agent/
       tools.ts                 # Tool definitions (JSON schema, strict) + zod input schemas + executors
       grounding.ts             # Tracks provider ids the model has seen; rebuilt from tool_calls
+      urgency-record.ts        # The rule engine's latest urgency; rebuilt from tool_calls, enforced at the exit tool
+      tool-summary.ts          # One-line chip text per tool outcome, shared by the live event and the projection
       prompt.ts                # System prompt (static, cacheable) + locale note
-      run-turn.ts              # The agent loop: Claude streaming call -> tool execution -> loop
-      claude.ts                # Anthropic client factory + the narrow ClaudeClient type tests fake
+      run-turn.ts              # The agent loop: Claude streaming call -> tool execution -> loop; settles interrupted tool calls
+      claude.ts                # Credential modes + client factory + the narrow ClaudeClient type tests fake
       index.ts                 # Barrel
     http/
       errors.ts                # AppError -> { error: { code, message, details? } }
       rate-limit.ts            # In-memory sliding window per IP
       sse.ts                   # AgentEvent -> SSE encoding, heartbeats, terminal-event guarantee
       projection.ts            # Stored messages/tool_calls/recommendations -> ConversationView
-      request.ts               # JSON body reading (size cap), id/query parsing, lazy agent deps
-tests/                         # vitest: triage, tools, grounding, run-turn, http, repositories
-  helpers/fake-claude.ts       # Scripted fake Claude client (no network)
+      request.ts               # JSON body reading (size cap), id/query parsing, rate limiters, lock TTL, lazy agent deps
+tests/                         # vitest (config: vitest.config.mts, alias @ -> src)
+  triage.test.ts               # Rule engine: every rule, precedence, input schema
+  tools.test.ts                # Tool definitions and executors (grounding + urgency rejections)
+  grounding.test.ts            # GroundingSet rebuilt from tool_calls
+  run-turn.test.ts             # Agent loop end-to-end with the fake client
+  provider-modes.test.ts       # Credential modes: env -> profile, client factory, request shape per mode
+  http.test.ts                 # SSE writer (encoding, heartbeats, terminal-event guarantee, disconnect), errors, body reading, id/query parsing, rate limiter, projection
+  sse.test.ts                  # Browser SSE parser (chunk/multibyte/CRLF boundaries, heartbeat comments, EOF) + AgentEvent decoding
+  repositories.test.ts         # Shared suite for memory (always) and Postgres (with DATABASE_URL); retention
+  ui.test.ts                   # React-free UI helpers: event decoding, error copy, hydration policy
+  helpers/fake-claude.ts       # Scripted fake Claude client (no network; enforces API message invariants)
 scripts/
   eval.ts, scenarios.ts        # `npm run eval`: scripted patient scenarios against the real model
 docs/                          # This folder
 docker-compose.yml             # Local Postgres 16
 .github/workflows/ci.yml       # lint, typecheck, test, build on push/PR to main
 drizzle.config.ts              # drizzle-kit (used by `npm run db:push`)
+vitest.config.mts              # vitest config (ESM; `tests/**/*.test.ts`, node environment)
 ```
 
-**Rule:** nothing under `src/server` imports from `next`, `react` or `src/app`. Route handlers only parse the request, call the server layer and encode the response. This keeps the backend portable (NestJS/Hono/Express) and testable. (The one exception is `app/api/health/route.ts`, which calls Next's `connection()` so the liveness probe is never prerendered under Cache Components; that import lives in the route, not in `src/server`.)
+**Rule:** nothing under `src/server` imports from `next`, `react` or `src/app`. Route handlers only parse the request, call the server layer and encode the response. This keeps the backend portable (NestJS/Hono/Express) and testable. The two Next-specific pieces live in the app layer: `app/api/health/route.ts` calls Next's `connection()` so the liveness probe is never prerendered under Cache Components, and `app/api/_lib/route-error.ts` wraps `toErrorResponse` with `unstable_rethrow` so the framework's internal control-flow errors reach Next instead of becoming a 500.
 
 ## Request / data flow
 
@@ -88,10 +101,11 @@ sequenceDiagram
 
     U->>R: { content, locale }
     R->>R: uuid check, zod validate, 16 KB cap, rate limit
-    R->>DB: tryAcquireTurnLock(id, 120s)
+    R->>DB: tryAcquireTurnLock(id, AGENT_MAX_STEPS x 60s)
     R-->>U: SSE conversation event (stream opens)
     R->>A: runTurn({ conversationId, userText, locale })
-    A->>DB: load tool_calls (rebuild grounding set) + message history
+    A->>DB: load tool_calls (rebuild grounding set + urgency record) + message history
+    A->>DB: settle a dangling tool_use from a crashed turn (is_error results), if any
     A->>DB: append user message
     loop up to AGENT_MAX_STEPS
         A->>C: beta.messages.stream(system, tools, history)
@@ -109,6 +123,7 @@ sequenceDiagram
             A-->>U: SSE done or error
         end
     end
+    A->>DB: finally: is_error tool_results for any tool_use left unanswered
     R->>DB: releaseTurnLock(id)  (always, in finally)
 ```
 
@@ -124,7 +139,7 @@ connection but is dropped by the browser parser and does not reset the UI's 90 s
 | `conversation` | `{ conversationId }` | store id (always the first event) |
 | `text_delta` | `{ text }` | append to current assistant bubble |
 | `tool_call` | `{ id, name, input }` | show activity chip ("Checking urgency…") |
-| `tool_result` | `{ id, name, ok, summary }` | update chip |
+| `tool_result` | `{ id, name, ok, summary, urgency? }` — `urgency` (enum) only on a successful `assess_urgency` | update chip; raise or clear the emergency banner from the engine's verdict |
 | `recommendation` | `{ recommendation: Recommendation }` — `{ id, nextStep, urgency, specialty, rationale, providers: ProviderSummary[], questionsRemaining, createdAt }` | render recommendation card + provider cards |
 | `done` | `{ stopReason, usage: { inputTokens, outputTokens, cacheReadInputTokens } }` | close bubble |
 | `error` | `{ code, message, retryable }` | show error state (retry button when retryable) |
@@ -135,7 +150,7 @@ model's free text is never parsed for provider names.
 
 ## Conversation persistence (append-only)
 
-The Claude API is stateless, so the full history is sent on every step. We persist the *exact* content blocks returned by the API (including `thinking` blocks) and the `tool_result` blocks we sent, in order, and never edit earlier turns. This is required for prompt caching to hit and for the model's preserved-thinking checks to pass. The UI gets a separate, simplified projection (`GET /api/conversations/:id`, computed by `http/projection.ts`) that merges each agent turn into one assistant message and hides tool plumbing.
+The Claude API is stateless, so the full history is sent on every step. We persist the *exact* content blocks returned by the API (including `thinking` blocks) and the `tool_result` blocks we sent, in order, and never edit earlier turns. This is required for prompt caching to hit (in direct-API mode a top-level `cache_control` also puts a breakpoint on the last history block) and for the model's preserved-thinking checks to pass. The history is kept replayable by construction: every `tool_use` the model emitted gets a `tool_result`, if necessary an `is_error` one written by the loop's `finally` block when a turn is cut short, and a trailing unanswered `tool_use` left by a crash is repaired at the start of the next turn. The UI gets a separate, simplified projection (`GET /api/conversations/:id`, computed by `http/projection.ts`) that merges each agent turn into one assistant message and hides tool plumbing.
 
 Tables: `conversations` (with the turn-lock timestamp), `messages`, `tool_calls` (audit), `recommendations`, `providers` — see [DATABASE.md](DATABASE.md).
 
@@ -145,7 +160,7 @@ A separate service would show "API architecture" more loudly but doubles deploym
 
 ## Scaling notes (what changes beyond the prototype)
 
-- Rate limiting moves from in-memory to Redis; the turn lock is already a DB row (`conversations.turn_locked_until`) and works across instances in Postgres mode.
+- Rate limiting (messages and conversation creation) moves from in-memory to Redis; the turn lock is already a DB row (`conversations.turn_locked_until`) and works across instances in Postgres mode. Memory-mode retention (60 min idle, 1000 conversations) becomes a retention job in Postgres.
 - Provider search gains full-text/semantic search (pgvector) behind the same `ProviderRepository` interface; the tool contract stays the same.
 - Conversations get an owner (auth) and retention policy; PHI is encrypted at rest.
 - The agent loop is already a pure function of `(history, tools, client)`; it can run in a queue worker if turns get long.
