@@ -8,22 +8,23 @@ Inputs we do not trust: the browser (any JSON), the model (tool arguments and pr
 
 | Area | Control |
 | --- | --- |
-| Input validation | zod on every HTTP body/query and on every tool input before execution. Enums for specialty/urgency/next_step, bounded numbers, bounded array lengths. |
-| Model output | Tool arguments are validated (strict JSON schema + zod). Free text is displayed as text only. Provider cards come from DB rows by id. |
-| Grounding | `recommend_next_step` rejects provider ids not returned by tools in this conversation (see AGENT.md). |
-| Prompt injection | Tool results are JSON from our own DB, serialised with a fixed shape; user text is only ever placed in `user` turns, never in the system prompt. The model has no tools that write anything except the recommendation record, and no network tools. |
-| Database | Parameterised queries via Drizzle; the model never writes SQL. The search tool exposes a fixed set of filters. |
-| Secrets | Server-only env vars (`src/server/config.ts`), never sent to the client; `.env` is git-ignored; `.env.example` documents shape only. |
-| Abuse | Per-IP rate limit on message posting; body size cap; max 6 model steps and bounded `max_tokens` per turn; one in-flight turn per conversation. |
-| Transport/browser | Security headers (CSP without `unsafe-eval`, nosniff, frame deny, referrer policy). Same-origin API; no CORS. |
-| Logging | Structured logs with conversation id, tool name, latency and token usage. **Message text is not logged.** |
-| Safety | Not-medical-advice disclaimer on every recommendation; emergencies instruct to call local emergency services immediately; the model's safety fallbacks are enabled and `refusal` is handled. |
+| Input validation | zod on every HTTP body/query (`src/shared/contracts.ts`) and on every tool input before execution (`src/server/agent/tools.ts`). Enums for specialty/urgency/next_step/red flags, bounded numbers, bounded array and string lengths. Conversation ids must be v4 UUIDs before they reach a query. |
+| Model output | Tool arguments are validated (strict JSON schema + zod). Free text is displayed as text only. Provider cards come from DB rows by id; the browser additionally re-validates `recommendation` events with the shared zod schema and drops anything off-contract. |
+| Grounding | `recommend_next_step` rejects provider ids not returned by tools in this conversation, and rejects an `emergency_now` / `emergency` mismatch (see AGENT.md). |
+| Prompt injection | Tool results are JSON from our own DB, serialised with a fixed shape; user text is only ever placed in `user` turns, never in the system prompt (the static block is never interpolated). The model has no tools that write anything except the recommendation record, and no network tools. |
+| Database | Parameterised queries via Drizzle; the model never writes SQL. The search tool exposes a fixed set of filters. Enum columns reject values outside the contracts. |
+| Secrets | Server-only env vars parsed once in `src/server/config.ts`, never sent to the client; `.env*` is git-ignored except `.env.example`, which documents shape only. Driver/SDK errors are logged server-side and replaced by generic messages before they reach the model or the browser. |
+| Abuse | Per-IP sliding-window rate limit on message posting (`RATE_LIMIT_PER_MINUTE`, default 20); 16 KB body cap checked on `Content-Length` and on actual bytes; `content` ≤ 2000 chars; `AGENT_MAX_STEPS` (default 6, max 10) model calls and `max_tokens: 4096` per step; one in-flight turn per conversation with a 120 s lock TTL. |
+| Transport/browser | Security headers on every response (`next.config.ts`): CSP (`default-src 'self'`, `connect-src 'self'`, `frame-ancestors 'none'`, `object-src 'none'`; `script-src 'self' 'unsafe-inline'` because Next's bootstrap and the pre-paint locale script are inline and un-nonced; `'unsafe-eval'` only under `next dev`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` denying camera/microphone/geolocation. Same-origin API; no CORS. |
+| Logging | One JSON line per agent step (`agent.step`: conversation id, step, stop reason, tool names, latency, token usage) plus `agent.tool_failed` / `agent.turn_failed` with the error string. **Message text is not logged.** The repository choice is logged once at startup without the URL. |
+| Safety | Not-medical-advice line required at the end of every rationale; emergencies instruct to call local emergency services immediately and the UI shows a `role="alert"` banner; the model's server-side safety fallbacks are enabled and `refusal` is handled; the prompt forbids asking for personal identifiers. |
 
 ## What production would add
 
 - Authentication (patients own conversations) and authorization checks on every conversation route; conversation ids alone are not an access control.
 - Encryption at rest for `messages`, data-retention and deletion workflows, audit logging for staff access (HIPAA/GDPR style obligations).
-- Redis-backed rate limiting and turn locking; WAF/bot protection at the edge.
+- Redis-backed rate limiting; WAF/bot protection at the edge. (The turn lock already lives in the database.)
+- A nonce-based CSP so `'unsafe-inline'` can be dropped from `script-src`.
 - Secrets in a managed vault; rotated keys; separate API keys per environment with spend limits.
 - Clinical review of the triage rule table and a release process for changing it.
 - Evals in CI against fixed scenarios so a prompt change cannot silently change triage behaviour.
@@ -32,8 +33,8 @@ Inputs we do not trust: the browser (any JSON), the model (tool arguments and pr
 
 Errors are typed at each layer and translated once at the boundary:
 
-- `AppError(code, status, message, details?)` in `src/server/http/errors.ts`. Route handlers catch everything, log, and return the shared error shape; unexpected errors become `internal_error` without leaking internals.
-- Inside the agent loop, tool failures are **not exceptions**: they are returned to the model as `tool_result` with `is_error: true` and a short human-readable reason, so the model can recover (ask again, widen the search). Only infrastructure failures (API down after retries, DB unreachable) abort the turn, emitting an `error` SSE event with `retryable`.
-- The SDK's typed errors (`RateLimitError`, `APIConnectionError`, `APIError` with status) decide `retryable` and the HTTP status for non-streaming endpoints.
-- The UI distinguishes "assistant is still thinking", "tool running", "recoverable error (retry button)" and "unrecoverable error (start new conversation)".
-- Streams always end with exactly one terminal event (`done` or `error`), so the client never waits forever; the client also applies a 90s inactivity timeout.
+- `AppError(code, status, message, details?, headers?)` in `src/server/http/errors.ts`, with helpers `badRequest`, `notFound`, `payloadTooLarge`, `rateLimited` (sets `Retry-After`), `conflict` (409 `turn_in_progress`), `upstream`, `internal`. Route handlers catch everything and call `toErrorResponse`: `AppError` → its status and body; `ZodError` → 400 `validation_error` with the first issue as the message and the flattened issues as `details`; anything else → logged and returned as a generic 500 `internal_error` without leaking internals.
+- Inside the agent loop, tool failures are **not exceptions**: they are returned to the model as `tool_result` with `is_error: true` and a short human-readable reason, so the model can recover (ask again, widen the search). Only model-call failures abort the turn, emitting an `error` SSE event with `retryable`.
+- The SDK's typed errors decide `retryable`: `AuthenticationError` → `upstream_error` not retryable; `RateLimitError`, `APIConnectionError` and 5xx → `upstream_error` retryable (the SDK itself has already retried twice); other 4xx → not retryable; cancellation and unknown throws → `internal_error`.
+- Streams always end with exactly one terminal event (`done` or `error`): the SSE writer appends an `error` if the generator ends without one, converts a thrown `AppError` into an `error` event with its safe message, masks unknown throws, and runs `onFinish` (lock release) exactly once — also when the client disconnects, in which case the agent generator is wound down. Heartbeat comments every 15 s keep idle connections open.
+- The UI distinguishes "assistant is still thinking", "tool running", "recoverable error (retry button)" and "unrecoverable error (start a new conversation)". It applies a 90 s inactivity timeout, treats an EOF without a terminal event as retryable, and clears a stored conversation id the server no longer knows (404 — e.g. a memory-mode restart).

@@ -4,14 +4,16 @@
 
 1. Show a clear separation between **HTTP adapters**, the **agent/domain layer**, and **data access**.
 2. Make the agent **safe by construction**: the model can only recommend providers it has fetched through tools; every boundary is validated.
-3. Keep it small. One deployable, one database, ~four tools.
+3. Keep it small. One deployable, one database, four tools.
 
 ## Repository layout
 
 ```
 src/
   app/                         # Next.js App Router (UI + thin HTTP adapters)
-    page.tsx                   # Chat page
+    layout.tsx                 # Fonts, metadata, LocaleProvider, pre-paint lang/dir boot script
+    page.tsx                   # Chat page (renders <ChatWindow />)
+    globals.css                # Tailwind import + Arabic-friendly font stack / RTL line-height
     api/
       health/route.ts          # GET  /api/health
       providers/route.ts       # GET  /api/providers?specialty=…
@@ -19,16 +21,26 @@ src/
       conversations/[id]/route.ts            # GET  /api/conversations/:id
       conversations/[id]/messages/route.ts   # POST /api/conversations/:id/messages  (SSE)
   components/                  # Chat UI (client components)
-  i18n/                        # en / ar dictionaries + direction helpers
+    ChatWindow.tsx             # Header, message log, emergency banner, composer, disclaimer
+    MessageBubble.tsx          # User/assistant bubbles, inline error + retry
+    ToolActivity.tsx           # Chips for tool_call / tool_result events
+    RecommendationCard.tsx     # Next step, urgency, rationale, provider cards (from DB rows only)
+    ProviderCard.tsx, EmergencyBanner.tsx, Composer.tsx, SamplePrompts.tsx, LocaleToggle.tsx
+    useAgentStream.ts          # Reducer-based state machine over the SSE stream (90s inactivity timeout, retry, cancel)
+    sse.ts                     # React-free SSE parser over ReadableStream
+    api.ts                     # fetch wrappers for the three conversation endpoints
+  i18n/
+    dictionaries.ts            # en / ar dictionaries with identical keys (type-checked)
+    locale.tsx                 # LocaleProvider / useLocale (localStorage, sets <html lang dir>)
   shared/
     contracts.ts               # Enums, DTOs, zod schemas and the AgentEvent union shared by server and UI
-  server/                      # Framework-independent backend (no `next` imports)
-    config.ts                  # Typed env parsing (zod)
+  server/                      # Framework-independent backend (no `next` / `react` imports)
+    config.ts                  # Typed env parsing (zod), lazy getConfig()
     db/
       schema.ts                # Drizzle schema (source of truth for the DB)
       client.ts                # Postgres connection (lazy; only when DATABASE_URL is set)
       seed-data.ts             # Synthetic providers used by both Postgres seed and memory repo
-      seed.ts                  # `npm run db:seed`
+      seed.ts                  # `npm run db:seed` (idempotent upsert)
     repositories/
       types.ts                 # ProviderRepository / ConversationRepository interfaces
       postgres.ts              # Drizzle implementation
@@ -37,22 +49,31 @@ src/
     triage/
       rules.ts                 # Red-flag rule table (data, not prose)
       engine.ts                # assessUrgency(input) -> deterministic result
+      index.ts                 # Barrel
     agent/
       tools.ts                 # Tool definitions (JSON schema, strict) + zod input schemas + executors
-      grounding.ts             # Tracks provider ids the model has seen; validates recommendations
-      prompt.ts                # System prompt (static, cacheable) + locale instruction
+      grounding.ts             # Tracks provider ids the model has seen; rebuilt from tool_calls
+      prompt.ts                # System prompt (static, cacheable) + locale note
       run-turn.ts              # The agent loop: Claude streaming call -> tool execution -> loop
-      claude.ts                # Anthropic client factory (injectable for tests)
+      claude.ts                # Anthropic client factory + the narrow ClaudeClient type tests fake
+      index.ts                 # Barrel
     http/
-      errors.ts                # AppError -> { error: { code, message } }
+      errors.ts                # AppError -> { error: { code, message, details? } }
       rate-limit.ts            # In-memory sliding window per IP
-      sse.ts                   # AgentEvent -> SSE encoding
-tests/                         # vitest
-scripts/eval.ts                # Scripted patient scenarios against the real model
+      sse.ts                   # AgentEvent -> SSE encoding, heartbeats, terminal-event guarantee
+      projection.ts            # Stored messages/tool_calls/recommendations -> ConversationView
+      request.ts               # JSON body reading (size cap), id/query parsing, lazy agent deps
+tests/                         # vitest: triage, tools, grounding, run-turn, http, repositories
+  helpers/fake-claude.ts       # Scripted fake Claude client (no network)
+scripts/
+  eval.ts, scenarios.ts        # `npm run eval`: scripted patient scenarios against the real model
 docs/                          # This folder
+docker-compose.yml             # Local Postgres 16
+.github/workflows/ci.yml       # lint, typecheck, test, build on push/PR to main
+drizzle.config.ts              # drizzle-kit (used by `npm run db:push`)
 ```
 
-**Rule:** nothing under `src/server` imports from `next`, `react` or `src/app`. Route handlers only parse the request, call the server layer and encode the response. This keeps the backend portable (NestJS/Hono/Express) and testable.
+**Rule:** nothing under `src/server` imports from `next`, `react` or `src/app`. Route handlers only parse the request, call the server layer and encode the response. This keeps the backend portable (NestJS/Hono/Express) and testable. (The one exception is `app/api/health/route.ts`, which calls Next's `connection()` so the liveness probe is never prerendered under Cache Components; that import lives in the route, not in `src/server`.)
 
 ## Request / data flow
 
@@ -66,55 +87,64 @@ sequenceDiagram
     participant DB as Repositories (Postgres | memory)
 
     U->>R: { content, locale }
-    R->>R: zod validate, rate limit, size cap
-    R->>DB: load conversation history
-    R->>A: runTurn(history + user message)
-    loop up to MAX_STEPS
-        A->>C: messages.stream(system, tools, history)
+    R->>R: uuid check, zod validate, 16 KB cap, rate limit
+    R->>DB: tryAcquireTurnLock(id, 120s)
+    R-->>U: SSE conversation event (stream opens)
+    R->>A: runTurn({ conversationId, userText, locale })
+    A->>DB: load tool_calls (rebuild grounding set) + message history
+    A->>DB: append user message
+    loop up to AGENT_MAX_STEPS
+        A->>C: beta.messages.stream(system, tools, history)
         C-->>A: text deltas (forwarded as SSE text_delta)
         C-->>A: final message (stop_reason, content blocks)
+        A->>DB: append assistant turn (verbatim blocks)
         alt stop_reason = tool_use
             A->>T: validate input (zod) and execute each tool
-            T->>DB: search / get providers
-            T-->>A: tool_result (or is_error)
-            A-->>U: SSE tool_call / tool_result
-            A->>DB: append assistant + tool_result turns (append-only)
+            T->>DB: search / get providers / save recommendation
+            T-->>A: ok + output, or error text
+            A->>DB: record tool_call (audit)
+            A-->>U: SSE tool_call / tool_result (/ recommendation)
+            A->>DB: append one user message with all tool_result blocks
         else end_turn / refusal / max_tokens
-            A->>DB: append assistant turn
+            A-->>U: SSE done or error
         end
     end
-    A-->>U: SSE recommendation (hydrated with DB rows) and done
+    R->>DB: releaseTurnLock(id)  (always, in finally)
 ```
 
 ### Streaming event contract
 
-The route streams `AgentEvent`s (defined in `src/shared/contracts.ts`) as SSE lines `event: <type>\ndata: <json>\n\n`:
+The route streams `AgentEvent`s (defined in `src/shared/contracts.ts`) as SSE frames
+`event: <type>\ndata: <json>\n\n`, where `<json>` is the whole event object including its `type`.
+A `: heartbeat` comment frame is sent every 15 s while the agent is silent.
 
-| event | payload | UI effect |
+| event | payload (besides `type`) | UI effect |
 | --- | --- | --- |
-| `conversation` | `{ conversationId }` | store id |
+| `conversation` | `{ conversationId }` | store id (always the first event) |
 | `text_delta` | `{ text }` | append to current assistant bubble |
 | `tool_call` | `{ id, name, input }` | show activity chip ("Checking urgency…") |
 | `tool_result` | `{ id, name, ok, summary }` | update chip |
-| `recommendation` | `{ nextStep, urgency, rationale, providers: ProviderDto[] , questionsRemaining }` | render recommendation card + provider cards |
-| `done` | `{ stopReason, usage }` | close bubble |
-| `error` | `{ code, message, retryable }` | show error state |
+| `recommendation` | `{ recommendation: Recommendation }` — `{ id, nextStep, urgency, specialty, rationale, providers: ProviderSummary[], questionsRemaining, createdAt }` | render recommendation card + provider cards |
+| `done` | `{ stopReason, usage: { inputTokens, outputTokens, cacheReadInputTokens } }` | close bubble |
+| `error` | `{ code, message, retryable }` | show error state (retry button when retryable) |
 
-Provider objects in `recommendation` are **loaded from the repository by id by the server** after validation. The model's free text is never parsed for provider names.
+Every stream ends with exactly one terminal event (`done` or `error`). Provider objects in
+`recommendation` are **loaded from the repository by id by the server** after validation. The
+model's free text is never parsed for provider names.
 
 ## Conversation persistence (append-only)
 
-The Claude API is stateless, so the full history is sent on every step. We persist the *exact* content blocks returned by the API (including `thinking` blocks) and the `tool_result` blocks we sent, in order, and never edit earlier turns. This is required for prompt caching to hit and for the model's preserved-thinking checks to pass. The UI gets a separate, simplified projection (`GET /api/conversations/:id`) that hides tool plumbing.
+The Claude API is stateless, so the full history is sent on every step. We persist the *exact* content blocks returned by the API (including `thinking` blocks) and the `tool_result` blocks we sent, in order, and never edit earlier turns. This is required for prompt caching to hit and for the model's preserved-thinking checks to pass. The UI gets a separate, simplified projection (`GET /api/conversations/:id`, computed by `http/projection.ts`) that merges each agent turn into one assistant message and hides tool plumbing.
 
-Tables: `conversations`, `messages`, `tool_calls` (audit), `recommendations`, `providers` — see [DATABASE.md](DATABASE.md).
+Tables: `conversations` (with the turn-lock timestamp), `messages`, `tool_calls` (audit), `recommendations`, `providers` — see [DATABASE.md](DATABASE.md).
 
 ## Why one Next.js app instead of a separate NestJS service
 
-A separate service would show "API architecture" more loudly but doubles deployment and CORS/auth surface for a 24–48h prototype. The compromise: route handlers are two-line adapters and the whole backend lives under `src/server` with an explicit no-framework-imports rule and its own tests. Moving it into NestJS is mechanical (controllers call the same functions). See [DECISIONS.md](DECISIONS.md).
+A separate service would show "API architecture" more loudly but doubles deployment and CORS/auth surface for a 24–48h prototype. The compromise: route handlers are a few lines each and the whole backend lives under `src/server` with an explicit no-framework-imports rule and its own tests. Moving it into NestJS is mechanical (controllers call the same functions). See [DECISIONS.md](DECISIONS.md).
 
 ## Scaling notes (what changes beyond the prototype)
 
-- Rate limiting and conversation locking move from in-memory to Redis.
+- Rate limiting moves from in-memory to Redis; the turn lock is already a DB row (`conversations.turn_locked_until`) and works across instances in Postgres mode.
 - Provider search gains full-text/semantic search (pgvector) behind the same `ProviderRepository` interface; the tool contract stays the same.
 - Conversations get an owner (auth) and retention policy; PHI is encrypted at rest.
 - The agent loop is already a pure function of `(history, tools, client)`; it can run in a queue worker if turns get long.
